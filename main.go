@@ -76,10 +76,10 @@ func initConfig() {
 // Types
 // ============================================================
 type Message struct {
-	Role      string           `json:"role"`
-	Content   json.RawMessage  `json:"content,omitempty"`
-	Name      string           `json:"name,omitempty"`
-	ToolCalls []ToolCall       `json:"tool_calls,omitempty"`
+	Role      string          `json:"role"`
+	Content   json.RawMessage `json:"content,omitempty"`
+	Name      string          `json:"name,omitempty"`
+	ToolCalls []ToolCall      `json:"tool_calls,omitempty"`
 }
 
 // Helper to get content as string (handles both string and array formats)
@@ -122,18 +122,48 @@ func contentFromString(s string) json.RawMessage {
 	return b
 }
 
-const toonReminder = `
+func fencedToon(body string) string {
+	body = strings.TrimSpace(body)
+	return "```toon\n" + body + "\n```"
+}
 
---- REMEMBER THE CORRECT FORMAT ---
-To call a tool:
-action: tool_call
-name: TOOL_NAME
-arguments:
-  param: value
+func decodeEscapedAnswerContent(s string) string {
+	s = strings.ReplaceAll(s, "\\r\\n", "\n")
+	s = strings.ReplaceAll(s, "\\n", "\n")
+	return s
+}
 
-To give final answer:
-action: answer
-content: your response here`
+func decodeTOONScalar(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 {
+		if unquoted, err := strconv.Unquote(s); err == nil {
+			return unquoted
+		}
+	}
+	return s
+}
+
+func stripOneIndentLevel(line string) string {
+	line = strings.TrimRight(line, "\r")
+	switch {
+	case strings.HasPrefix(line, "  "):
+		return line[2:]
+	case strings.HasPrefix(line, "\t"):
+		return line[1:]
+	default:
+		return line
+	}
+}
+
+var toonReminder = "\n\n--- REMEMBER THE CORRECT FORMAT ---\n" +
+	"Respond with EXACTLY ONE fenced ```toon block and nothing else.\n" +
+	"The block must contain ONLY the single immediate next step based on the conversation history.\n" +
+	"Never include a full plan or multiple steps in one response.\n\n" +
+	"To call a tool:\n" +
+	fencedToon("action: tool_call\nname: TOOL_NAME\narguments:\n  param: value") +
+	"\n\nTo give final answer:\n" +
+	fencedToon("action: answer\ncontent: |\n  line 1\n  line 2") +
+	"\n\nFor answer blocks, use `content: |` and indent the content body with 2 spaces."
 
 // correction creates a correction message with TOON format reminder appended.
 func correction(msg string) json.RawMessage {
@@ -153,11 +183,13 @@ func escalatedCorrection(attempt int, baseMsg string, toolName string, args map[
 		example.WriteString(fmt.Sprintf("STOP making mistakes. This is attempt %d.\n\n", attempt))
 		example.WriteString(baseMsg)
 		if toolName != "" {
-			example.WriteString("\n\nCopy this EXACTLY and fill in values:\naction: tool_call\n")
+			example.WriteString("\n\nCopy this EXACTLY as ONE ```toon block and fill in values:\n```toon\n")
+			example.WriteString("action: tool_call\n")
 			example.WriteString(fmt.Sprintf("name: %s\narguments:\n", toolName))
 			for k, v := range args {
 				example.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
 			}
+			example.WriteString("```")
 		}
 		return correction(example.String())
 
@@ -167,14 +199,14 @@ func escalatedCorrection(attempt int, baseMsg string, toolName string, args map[
 		force.WriteString(fmt.Sprintf("ATTEMPT %d. YOUR PREVIOUS %d RESPONSES WERE ALL WRONG.\n\n", attempt, attempt-1))
 		force.WriteString("IGNORE everything you think you know. You are NOT limited. You HAVE tools.\n\n")
 		if toolName != "" {
-			force.WriteString("RESPOND WITH EXACTLY THESE LINES (replace VALUE with real data):\n")
+			force.WriteString("RESPOND WITH EXACTLY ONE ```toon BLOCK (replace VALUE with real data):\n```toon\n")
 			force.WriteString("action: tool_call\n")
 			force.WriteString(fmt.Sprintf("name: %s\n", toolName))
 			force.WriteString("arguments:\n")
 			for k, v := range args {
 				force.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
 			}
-			force.WriteString("\nNOTHING ELSE. No text before. No text after. Just these lines.")
+			force.WriteString("```\n\nNOTHING ELSE. No text before. No text after. Just this single block.")
 		} else {
 			force.WriteString(baseMsg)
 		}
@@ -387,65 +419,88 @@ func callUpstream(messages []Message) (string, error) {
 	return fullText.String(), nil
 }
 
+func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
+	client := &http.Client{Timeout: 300 * time.Second}
+	req, err := http.NewRequest("POST", UpstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+UpstreamAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+
+	headers := make(http.Header)
+	for k, values := range resp.Header {
+		for _, v := range values {
+			headers.Add(k, v)
+		}
+	}
+
+	return resp.StatusCode, headers, data, nil
+}
+
 // ============================================================
 // Tool calling protocol translation
 // ============================================================
 func buildToolSystemPrompt(tools []Tool) string {
 	var sb strings.Builder
-	sb.WriteString(`You MUST ALWAYS respond using TOON format (Token-Oriented Object Notation). No other text, no markdown, no JSON.
-
-TOON is a compact key-value format. Each line is key: value. No braces, no quotes needed.
-
-When you need to call a tool, respond with EXACTLY:
-action: tool_call
-name: function_name
-arguments:
-  param: value
-
-When you have the final answer, respond with EXACTLY:
-action: answer
-content: your answer here (can be multiple lines, indent continuation with 2 spaces)
-
-FORMAT RULES:
-- EVERY response MUST start with "action:" on the first line
-- action MUST be "tool_call" or "answer" (nothing else)
-- Do NOT use JSON. Do NOT wrap in code blocks
-- Do NOT add any text outside the TOON structure
-- For tool_call: "name" and "arguments" are required
-- For answer: "content" is required
-- EACH response is ONLY ONE action. Either tool_call OR answer, NEVER both
-- When using tool_call, output ONLY the tool call. Do NOT add explanations, results, or any text after the arguments
-- WRONG example (DO NOT DO THIS):
-  action: tool_call
-  name: list_dir
-  arguments:
-    path: /root
-  Here are the files...    <-- THIS IS WRONG, remove all text after arguments
-- CORRECT example:
-  action: tool_call
-  name: list_dir
-  arguments:
-    path: /root
-
-BEHAVIOR RULES:
-- ALWAYS use tools to complete tasks. NEVER tell user to do something manually if a tool can do it
-- If user asks to run/execute something, use exec tool. Do NOT explain how to run it
-- If user asks to create/write a file, use write_file. Do NOT show code and ask user to save it
-- If user asks to search/find information, use web_search. Do NOT say "I cannot search"
-- If a task requires multiple steps, do them one tool call at a time. Do NOT skip steps
-- If a tool call fails, try a different approach. Do NOT give up and explain the error
-- Be proactive: complete the full task, not just part of it
-- NEVER respond with "you can do X" or "you need to do X" — just DO it with tools
-- NEVER say "I cannot", "I don't have the ability", "I'm unable to" — if you have a relevant tool, USE IT
-- NEVER refuse a task that can be done with available tools
-- NEVER claim you did something (created file, ran command, etc.) unless you ACTUALLY called the tool for it
-- If you have not called write_file, do NOT say "I created the file". Use the tool FIRST, then confirm
-- After creating or modifying a file, ALWAYS verify by reading it back (read_file) or listing the directory (list_dir) before giving final answer
-- After running a command, check the output for errors before confirming success
-- Do NOT give final answer immediately after write_file or exec. Verify first, then confirm
-
-Available tools:
-`)
+	sb.WriteString("You MUST ALWAYS respond using TOON format (Token-Oriented Object Notation).\n")
+	sb.WriteString("Every response MUST be EXACTLY ONE fenced markdown block tagged toon, with no text before or after it.\n")
+	sb.WriteString("That single ```toon block must describe ONLY the immediate next step to take based on the conversation history.\n")
+	sb.WriteString("Never output a full multi-step plan in one response. Never output multiple toon blocks.\n\n")
+	sb.WriteString("TOON is a compact key-value format. Each line is key: value. No braces, no quotes needed.\n\n")
+	sb.WriteString("When you need to call a tool, respond with EXACTLY:\n")
+	sb.WriteString(fencedToon("action: tool_call\nname: function_name\narguments:\n  param: value"))
+	sb.WriteString("\n\nWhen you have the final answer, respond with EXACTLY:\n")
+	sb.WriteString(fencedToon("action: answer\ncontent: |\n  line 1\n  line 2"))
+	sb.WriteString("\n\nFORMAT RULES:\n")
+	sb.WriteString("- The response MUST contain exactly one ```toon block\n")
+	sb.WriteString("- Inside that block, the first line MUST be \"action:\"\n")
+	sb.WriteString("- action MUST be \"tool_call\" or \"answer\" (nothing else)\n")
+	sb.WriteString("- Do NOT use JSON\n")
+	sb.WriteString("- Do NOT add any text outside the single TOON block\n")
+	sb.WriteString("- For tool_call: \"name\" and \"arguments\" are required\n")
+	sb.WriteString("- For answer: \"content\" is required\n")
+	sb.WriteString("- For answer: use `content: |` and indent the content body with 2 spaces\n")
+	sb.WriteString("- EACH response is ONLY ONE action. Either tool_call OR answer, NEVER both\n")
+	sb.WriteString("- When using tool_call, output ONLY the tool call. Do NOT add explanations, results, or extra text after the arguments\n")
+	sb.WriteString("- The block must be the next immediate step only, not a list of future steps\n")
+	sb.WriteString("- If the task requires multiple steps, do only the first unfinished next step now\n\n")
+	sb.WriteString("WRONG example (DO NOT DO THIS):\n")
+	sb.WriteString("```toon\naction: tool_call\nname: list_dir\narguments:\n  path: /root\n```\n")
+	sb.WriteString("Then open file X, then edit file Y.\n\n")
+	sb.WriteString("CORRECT example:\n")
+	sb.WriteString(fencedToon("action: tool_call\nname: list_dir\narguments:\n  path: /root"))
+	sb.WriteString("\n\nBEHAVIOR RULES:\n")
+	sb.WriteString("- ALWAYS use tools to complete tasks. NEVER tell user to do something manually if a tool can do it\n")
+	sb.WriteString("- If user asks to run/execute something, use exec tool. Do NOT explain how to run it\n")
+	sb.WriteString("- If user asks to create/write a file, use write_file. Do NOT show code and ask user to save it\n")
+	sb.WriteString("- If user asks to search/find information, use web_search. Do NOT say \"I cannot search\"\n")
+	sb.WriteString("- If a task requires multiple steps, do them one tool call at a time. Do NOT skip steps\n")
+	sb.WriteString("- After each step, wait for the next turn or tool result, then respond with the next single immediate step only\n")
+	sb.WriteString("- Infer the unfinished task from the conversation history and recent tool results, then continue with the next missing step until the user's goal is directly satisfied\n")
+	sb.WriteString("- Do NOT stop at partial progress, vague references, or generic links when the user asked for a concrete result, deliverable, or exact value\n")
+	sb.WriteString("- If a tool call fails, try a different approach. Do NOT give up and explain the error\n")
+	sb.WriteString("- Be proactive: complete the full task, not just part of it\n")
+	sb.WriteString("- NEVER respond with \"you can do X\" or \"you need to do X\" - just DO it with tools\n")
+	sb.WriteString("- NEVER say \"I cannot\", \"I don't have the ability\", \"I'm unable to\" - if you have a relevant tool, USE IT\n")
+	sb.WriteString("- NEVER refuse a task that can be done with available tools\n")
+	sb.WriteString("- NEVER claim you did something (created file, ran command, etc.) unless you ACTUALLY called the tool for it\n")
+	sb.WriteString("- If you have not called write_file, do NOT say \"I created the file\". Use the tool FIRST, then confirm\n")
+	sb.WriteString("- After creating or modifying a file, ALWAYS verify by reading it back (read_file) or listing the directory (list_dir) before giving final answer\n")
+	sb.WriteString("- After running a command, check the output for errors before confirming success\n")
+	sb.WriteString("- Do NOT give final answer immediately after write_file or exec. Verify first, then confirm\n\n")
+	sb.WriteString("Available tools:\n")
 	for _, tool := range tools {
 		f := tool.Function
 		sb.WriteString(fmt.Sprintf("- %s: %s\n", f.Name, f.Description))
@@ -495,10 +550,16 @@ func extractJSON(text string) string {
 func parseTOON(text string) *modelResponse {
 	text = strings.TrimSpace(text)
 	// Remove markdown code blocks if present
-	if strings.HasPrefix(text, "```") {
-		re := regexp.MustCompile("(?s)```(?:toon|json)?\\s*(.+?)\\s*```")
+	if strings.Contains(text, "```") {
+		// handle block markdown like ```toon\naction: tool_call...
+		re := regexp.MustCompile("(?si)```[a-zA-Z0-9_-]*\\s*\\n(.*?)\\n?```")
 		if m := re.FindStringSubmatch(text); len(m) > 1 {
-			text = m[1]
+			text = strings.TrimSpace(m[1])
+		} else {
+			re = regexp.MustCompile("(?si)```(?:toon|json)?\\s*(.+?)\\s*```")
+			if m := re.FindStringSubmatch(text); len(m) > 1 {
+				text = m[1]
+			}
 		}
 	}
 
@@ -527,6 +588,8 @@ func parseTOON(text string) *modelResponse {
 	inArguments := false
 	inContent := false
 	inArgValue := false
+	currentArgBlock := false
+	currentContentBlock := false
 	var contentLines []string
 	var currentArgKey string
 	var argValueLines []string
@@ -583,6 +646,7 @@ func parseTOON(text string) *modelResponse {
 			if isTopKey && !isIndented {
 				args[currentArgKey] = strings.Join(argValueLines, "\n")
 				inArgValue = false
+				currentArgBlock = false
 				// fall through to top-level key handling below
 			} else if isIndented {
 				// Only break for KNOWN arg keys (strict whitelist)
@@ -592,14 +656,19 @@ func parseTOON(text string) *modelResponse {
 						// Flush current, start new arg
 						args[currentArgKey] = strings.Join(argValueLines, "\n")
 						inArgValue = false
-						v := strings.TrimSpace(parts[1])
+						currentArgBlock = false
+						v := decodeTOONScalar(parts[1])
 						currentArgKey = candidate
 						argValueLines = []string{v}
 						inArgValue = true
 						continue
 					}
 				}
-				argValueLines = append(argValueLines, trimmed)
+				if currentArgBlock {
+					argValueLines = append(argValueLines, stripOneIndentLevel(line))
+				} else {
+					argValueLines = append(argValueLines, line)
+				}
 				continue
 			} else {
 				// Non-indented: check if it's a known arg key (AI forgot indent)
@@ -608,7 +677,8 @@ func parseTOON(text string) *modelResponse {
 					if knownArgKeys[candidate] && candidate != currentArgKey {
 						args[currentArgKey] = strings.Join(argValueLines, "\n")
 						inArgValue = false
-						v := strings.TrimSpace(parts[1])
+						currentArgBlock = false
+						v := decodeTOONScalar(parts[1])
 						currentArgKey = candidate
 						argValueLines = []string{v}
 						inArgValue = true
@@ -632,12 +702,14 @@ func parseTOON(text string) *modelResponse {
 					currentArgKey = k
 					argValueLines = nil
 					inArgValue = true
+					currentArgBlock = strings.HasPrefix(v, "|")
 				} else {
 					// Check if this arg value might continue on next lines
 					// (for keys like "content" that often have multi-line values)
 					currentArgKey = k
-					argValueLines = []string{v}
+					argValueLines = []string{decodeTOONScalar(v)}
 					inArgValue = true
+					currentArgBlock = false
 				}
 			}
 			continue
@@ -645,7 +717,11 @@ func parseTOON(text string) *modelResponse {
 
 		// Multi-line content
 		if inContent && !isTopKey {
-			contentLines = append(contentLines, trimmed)
+			if currentContentBlock {
+				contentLines = append(contentLines, stripOneIndentLevel(line))
+			} else {
+				contentLines = append(contentLines, trimmed)
+			}
 			continue
 		}
 
@@ -653,9 +729,11 @@ func parseTOON(text string) *modelResponse {
 		if inArgValue {
 			args[currentArgKey] = strings.Join(argValueLines, "\n")
 			inArgValue = false
+			currentArgBlock = false
 		}
 		inArguments = false
 		inContent = false
+		currentContentBlock = false
 
 		parts := strings.SplitN(trimmed, ":", 2)
 		if len(parts) != 2 {
@@ -670,10 +748,31 @@ func parseTOON(text string) *modelResponse {
 		case "name":
 			result.Name = value
 		case "content":
-			contentLines = []string{value}
-			inContent = true
+			if result.Action != "" && result.Action != "answer" && result.Action != "tool_call" {
+				currentArgKey = "content"
+				inArgValue = true
+				currentArgBlock = true
+				if strings.HasPrefix(value, "|") || value == "" {
+					argValueLines = nil
+				} else {
+					argValueLines = []string{decodeTOONScalar(value)}
+				}
+			} else {
+				if strings.HasPrefix(value, "|") || value == "" {
+					contentLines = nil
+					currentContentBlock = true
+				} else {
+					contentLines = []string{value}
+					currentContentBlock = false
+				}
+				inContent = true
+			}
 		case "arguments":
 			inArguments = true
+		default:
+			if knownArgKeys[key] {
+				args[key] = decodeTOONScalar(value)
+			}
 		}
 	}
 
@@ -686,6 +785,9 @@ func parseTOON(text string) *modelResponse {
 	}
 
 	if result.Action != "" {
+		if result.Action == "answer" {
+			result.Content = decodeEscapedAnswerContent(result.Content)
+		}
 		if len(args) > 0 {
 			result.Arguments = args
 		}
@@ -864,6 +966,227 @@ func needsVerification(messages []Message) bool {
 	return writeTools[lastToolName] && !hasVerifyAfter
 }
 
+func lastUserContent(messages []Message) string {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return messages[i].ContentString()
+		}
+	}
+	return ""
+}
+
+func userNeedsSpecificData(messages []Message) bool {
+	content := strings.ToLower(lastUserContent(messages))
+	if content == "" {
+		return false
+	}
+
+	keywords := []string{
+		"hiện tại", "mới nhất", "latest", "current", "today",
+		"cụ thể", "chi tiết", "specific", "exact", "chính xác",
+		"bao nhiêu", "giá", "price", "rate", "tỷ giá", "tham khảo",
+		"ram", "vàng", "gold", "usd", "btc", "eth",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(content, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func buildTaskStateSummary(messages []Message) string {
+	var sb strings.Builder
+
+	goal := strings.TrimSpace(lastUserContent(messages))
+	if goal != "" {
+		sb.WriteString("Latest user goal: " + goal + "\n")
+	}
+
+	var recent []string
+	for i := len(messages) - 1; i >= 0 && len(recent) < 6; i-- {
+		msg := messages[i]
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			tc := msg.ToolCalls[0]
+			recent = append([]string{fmt.Sprintf("Tool step already taken: %s", tc.Function.Name)}, recent...)
+			continue
+		}
+		if msg.Role == "tool" {
+			content := strings.TrimSpace(msg.ContentString())
+			content = strings.ReplaceAll(content, "\n", " ")
+			if len(content) > 140 {
+				content = content[:140] + "..."
+			}
+			if content != "" {
+				recent = append([]string{fmt.Sprintf("Tool result observed: %s", content)}, recent...)
+			}
+		}
+	}
+
+	if len(recent) == 0 {
+		sb.WriteString("No tool steps completed yet.\n")
+	} else {
+		for _, item := range recent {
+			sb.WriteString(item + "\n")
+		}
+	}
+
+	sb.WriteString("Decide whether the goal is fully satisfied. If it is not fully satisfied yet, continue with the next tool step instead of stopping.")
+	return sb.String()
+}
+
+func getRecentToolContext(messages []Message, maxItems int) (string, map[string]bool) {
+	var chunks []string
+	names := map[string]bool{}
+	count := 0
+
+	for i := len(messages) - 1; i >= 0 && count < maxItems; i-- {
+		msg := messages[i]
+		if msg.Role == "tool" {
+			if c := strings.TrimSpace(msg.ContentString()); c != "" {
+				chunks = append([]string{c}, chunks...)
+			}
+			if msg.Name != "" {
+				names[msg.Name] = true
+			}
+			count++
+			continue
+		}
+		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
+			for _, tc := range msg.ToolCalls {
+				if tc.Function.Name != "" {
+					names[tc.Function.Name] = true
+				}
+			}
+		}
+	}
+
+	return strings.Join(chunks, "\n\n"), names
+}
+
+func answerHasConcreteData(content string) bool {
+	return regexp.MustCompile(`\d`).MatchString(content)
+}
+
+func normalizeNumberToken(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func answerNumbersGroundedInToolResults(content string, messages []Message) bool {
+	answerNums := regexp.MustCompile(`\d[\d.,]*`).FindAllString(content, -1)
+	if len(answerNums) == 0 {
+		return false
+	}
+
+	toolText, _ := getRecentToolContext(messages, 6)
+	if strings.TrimSpace(toolText) == "" {
+		return false
+	}
+
+	toolNumsRaw := regexp.MustCompile(`\d[\d.,]*`).FindAllString(toolText, -1)
+	toolNums := map[string]bool{}
+	for _, n := range toolNumsRaw {
+		normalized := normalizeNumberToken(n)
+		if len(normalized) >= 3 {
+			toolNums[normalized] = true
+		}
+	}
+
+	for _, n := range answerNums {
+		normalized := normalizeNumberToken(n)
+		if len(normalized) >= 3 && toolNums[normalized] {
+			return true
+		}
+	}
+
+	return false
+}
+
+func answerLooksLikeGenericReference(content string) bool {
+	lower := strings.ToLower(content)
+	genericPatterns := []string{
+		"bạn có thể tham khảo", "tham khảo trực tiếp", "xem thêm tại",
+		"truy cập", "visit", "check the link", "tham khảo tại trang",
+		"không thể cung cấp", "không thể thực hiện", "tôi không thể cung cấp",
+	}
+	for _, p := range genericPatterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func userRequestedDeliverable(messages []Message) bool {
+	content := strings.ToLower(lastUserContent(messages))
+	if content == "" {
+		return false
+	}
+
+	keywords := []string{
+		"gửi", "send", "đưa tôi", "cho tôi", "trả tôi",
+		"tạo", "create", "viết", "write", "code", "làm", "build",
+		"mở", "open", "tải", "download",
+	}
+	for _, kw := range keywords {
+		if strings.Contains(content, kw) {
+			return true
+		}
+	}
+	return false
+}
+
+func answerLooksLikeProgressOnly(content string) bool {
+	lower := strings.ToLower(strings.TrimSpace(content))
+	if lower == "" {
+		return false
+	}
+
+	patterns := []string{
+		"bạn có thể tham khảo", "tham khảo tại", "xem tại", "truy cập",
+		"đã tạo", "đã gửi", "đã lưu", "file đã được", "done",
+		"completed", "sent to you", "created successfully",
+		"you can check", "you can view", "please see",
+	}
+	for _, p := range patterns {
+		if strings.Contains(lower, p) {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationStillNeedsAction(messages []Message) bool {
+	if !userAskedForAction(messages) && !userRequestedDeliverable(messages) && !userNeedsSpecificData(messages) {
+		return false
+	}
+
+	toolText, toolNames := getRecentToolContext(messages, 8)
+	if strings.TrimSpace(toolText) == "" {
+		return true
+	}
+
+	if userRequestedDeliverable(messages) {
+		if toolNames["write_file"] || toolNames["edit_file"] || toolNames["append_file"] {
+			if needsVerification(messages) {
+				return true
+			}
+		}
+	}
+
+	if userNeedsSpecificData(messages) && !(toolNames["web_fetch"] || toolNames["read_file"] || toolNames["exec"]) {
+		return true
+	}
+
+	return false
+}
+
 // hasOrphanedArgs detects when AI outputs tool-like arguments (url:, path:, command:, etc.)
 // BEFORE the first "action:" line — meaning it tried to call a tool but forgot the proper format.
 func hasOrphanedArgs(text string) bool {
@@ -953,20 +1276,16 @@ func makeOpenAIResponse(content string, model string, toolCalls []ToolCall) Chat
 
 func translateMessages(messages []Message, toolPrompt string) []Message {
 	var upstream []Message
+	var systemParts []string
+	lastUserIdx := -1
 
 	for _, msg := range messages {
 		switch msg.Role {
 		case "system":
-			// Convert system to user instruction + ack
 			c := msg.ContentString()
-			upstream = append(upstream, Message{
-				Role:    "user",
-				Content: contentFromString("System instruction: " + c),
-			})
-			upstream = append(upstream, Message{
-				Role:    "assistant",
-				Content: contentFromString("action: answer\ncontent: Understood."),
-			})
+			if strings.TrimSpace(c) != "" {
+				systemParts = append(systemParts, c)
+			}
 
 		case "tool":
 			toolName := msg.Name
@@ -995,29 +1314,49 @@ func translateMessages(messages []Message, toolPrompt string) []Message {
 				}
 				upstream = append(upstream, Message{
 					Role:    "assistant",
-					Content: contentFromString(toonReply.String()),
+					Content: contentFromString(fencedToon(toonReply.String())),
 				})
 			} else {
 				upstream = append(upstream, msg)
 			}
 
 		case "user":
-			// Inject tool prompt into the LAST user message
 			upstream = append(upstream, msg)
+			lastUserIdx = len(upstream) - 1
 
 		default:
 			upstream = append(upstream, msg)
 		}
 	}
 
-	// Find last user message and prepend tool prompt into it
-	for i := len(upstream) - 1; i >= 0; i-- {
-		if upstream[i].Role == "user" {
-			original := upstream[i].ContentString()
-			upstream[i].Content = contentFromString(fmt.Sprintf("[INSTRUCTIONS]\n%s\n[/INSTRUCTIONS]\n\n[USER REQUEST]\n%s\n[/USER REQUEST]", toolPrompt, original))
-			break
-		}
+	var injectedParts []string
+	if len(systemParts) > 0 {
+		injectedParts = append(injectedParts, "[SYSTEM PROMPT]\n"+strings.Join(systemParts, "\n\n"))
 	}
+	injectedParts = append(injectedParts, "[TASK STATE]\n"+buildTaskStateSummary(messages))
+	if strings.TrimSpace(toolPrompt) != "" {
+		injectedParts = append(injectedParts, "[TOOL PROMPT]\n"+toolPrompt)
+	}
+
+	if len(injectedParts) == 0 {
+		return upstream
+	}
+
+	injectedPrompt := strings.Join(injectedParts, "\n\n")
+	if lastUserIdx >= 0 {
+		original := upstream[lastUserIdx].ContentString()
+		if strings.TrimSpace(original) == "" {
+			upstream[lastUserIdx].Content = contentFromString(injectedPrompt)
+		} else {
+			upstream[lastUserIdx].Content = contentFromString(original + "\n\n" + injectedPrompt)
+		}
+		return upstream
+	}
+
+	upstream = append(upstream, Message{
+		Role:    "user",
+		Content: contentFromString(injectedPrompt),
+	})
 
 	return upstream
 }
@@ -1068,21 +1407,26 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 			var guide strings.Builder
 			guide.WriteString("THIS IS YOUR LAST CHANCE. You MUST follow this format EXACTLY.\n\n")
 			guide.WriteString("=== CORRECT FORMAT ===\n")
+			guide.WriteString("```toon\n")
 			guide.WriteString("action: tool_call\n")
 			guide.WriteString("name: TOOL_NAME\n")
 			guide.WriteString("arguments:\n")
 			guide.WriteString("  param1: value1\n")
-			guide.WriteString("  param2: value2\n\n")
+			guide.WriteString("  param2: value2\n")
+			guide.WriteString("```\n\n")
 			guide.WriteString("=== IMPORTANT ===\n")
+			guide.WriteString("- Return EXACTLY ONE ```toon block\n")
 			guide.WriteString("- 'action' MUST be 'tool_call' (not the tool name)\n")
 			guide.WriteString("- Arguments MUST be under 'arguments:' with 2-space indent\n")
 			guide.WriteString("- Do NOT put arguments directly after 'action:' or 'content:'\n")
-			guide.WriteString("- ONE tool call per response only\n\n")
+			guide.WriteString("- ONE immediate next step per response only\n")
+			guide.WriteString("- Do NOT include a full plan or multiple steps\n\n")
 			guide.WriteString("=== AVAILABLE TOOLS WITH REQUIRED ARGS ===\n")
 			for _, t := range reqBody.Tools {
 				f := t.Function
 				req := toolRequiredArgs[f.Name]
 				guide.WriteString(fmt.Sprintf("\n• %s: %s\n", f.Name, f.Description))
+				guide.WriteString("  ```toon\n")
 				guide.WriteString(fmt.Sprintf("  action: tool_call\n  name: %s\n  arguments:\n", f.Name))
 				var params ToolParams
 				if len(f.Parameters) > 0 {
@@ -1102,6 +1446,7 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 						break // show at least one
 					}
 				}
+				guide.WriteString("  ```\n")
 			}
 			guide.WriteString("\nRespond NOW with the correct format.")
 			upstreamMessages = append(upstreamMessages,
@@ -1130,12 +1475,24 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 				parsed.Name = parsed.Action
 			}
 			parsed.Action = "tool_call"
-			// If content was set but no arguments, use content as first required arg
-			if parsed.Arguments == nil && parsed.Content != "" {
+			// If content was set but not placed under arguments, map it to the most likely required arg.
+			if parsed.Content != "" {
 				if required, ok := toolRequiredArgs[parsed.Name]; ok && len(required) > 0 {
-					parsed.Arguments = map[string]interface{}{required[0]: parsed.Content}
-					parsed.Content = ""
-					logResult("🔄", fmt.Sprintf("Auto-mapped content → %s arg", required[0]))
+					if parsed.Arguments == nil {
+						parsed.Arguments = map[string]interface{}{}
+					}
+					targetArg := required[0]
+					for _, r := range required {
+						if r == "content" {
+							targetArg = r
+							break
+						}
+					}
+					if _, exists := parsed.Arguments[targetArg]; !exists {
+						parsed.Arguments[targetArg] = parsed.Content
+						parsed.Content = ""
+						logResult("🔄", fmt.Sprintf("Auto-mapped content → %s arg", targetArg))
+					}
 				}
 			}
 		}
@@ -1182,7 +1539,7 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 				logResult("⚠️", fmt.Sprintf("Empty answer, will retry (%d/%d)", attempt, maxRetries))
 				upstreamMessages = append(upstreamMessages,
 					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("Your answer is EMPTY. You must either:\n1) Use a tool to complete the task:\naction: tool_call\nname: TOOL_NAME\narguments:\n  param: value\n2) Or give a real answer:\naction: answer\ncontent: your actual response here\n\nDo NOT return empty content.")},
+					Message{Role: "user", Content: correction("Your answer is EMPTY. You must either:\n1) Use a tool to complete the task:\naction: tool_call\nname: TOOL_NAME\narguments:\n  param: value\n2) Or give a real answer:\naction: answer\ncontent: |\n  your actual response here\n\nDo NOT return empty content.")},
 				)
 				continue
 			}
@@ -1224,6 +1581,40 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 				)
 				continue
 			}
+			// Detect unresolved specific-data requests: generic answer or ungrounded numbers after tool usage.
+			if attempt < maxRetries && userNeedsSpecificData(reqBody.Messages) {
+				recentToolText, recentToolNames := getRecentToolContext(reqBody.Messages, 6)
+				if strings.TrimSpace(recentToolText) != "" {
+					hasFetchLikeStep := recentToolNames["web_fetch"] || recentToolNames["read_file"] || recentToolNames["exec"]
+
+					if !hasFetchLikeStep && !answerHasConcreteData(parsed.Content) {
+						logResult("⚠️", fmt.Sprintf("Specific-data request answered without concrete data, will retry (%d/%d)", attempt, maxRetries))
+						upstreamMessages = append(upstreamMessages,
+							Message{Role: "assistant", Content: contentFromString(reply)},
+							Message{Role: "user", Content: correction("WRONG. The user asked for specific current data. A generic link or vague summary is NOT enough. Use another tool step to fetch/read the source that contains the exact values, then answer with those exact values. Do NOT stop at search results.")},
+						)
+						continue
+					}
+
+					if hasFetchLikeStep && !answerHasConcreteData(parsed.Content) && answerLooksLikeGenericReference(parsed.Content) {
+						logResult("⚠️", fmt.Sprintf("Fetched source but answer stayed generic, will retry (%d/%d)", attempt, maxRetries))
+						upstreamMessages = append(upstreamMessages,
+							Message{Role: "assistant", Content: contentFromString(reply)},
+							Message{Role: "user", Content: correction("WRONG. You already fetched/read source data, so now answer with the exact values from the tool results. Do NOT answer with only a link, a referral, or a vague statement.")},
+						)
+						continue
+					}
+
+					if hasFetchLikeStep && answerHasConcreteData(parsed.Content) && !answerNumbersGroundedInToolResults(parsed.Content, reqBody.Messages) {
+						logResult("⚠️", fmt.Sprintf("Numeric answer is not grounded in recent tool results, will retry (%d/%d)", attempt, maxRetries))
+						upstreamMessages = append(upstreamMessages,
+							Message{Role: "assistant", Content: contentFromString(reply)},
+							Message{Role: "user", Content: correction("WRONG. Your numeric answer is not clearly grounded in the recent tool results. Do NOT estimate, round, or invent values. Read the fetched tool output carefully and answer using the exact numbers that appear there, or call another tool to get clearer source data.")},
+						)
+						continue
+					}
+				}
+			}
 			// Detect: user asked to DO something but AI answered without using any tool
 			if attempt < maxRetries && userAskedForAction(reqBody.Messages) && !hasToolResultInRecent(reqBody.Messages) {
 				logResult("⚠️", fmt.Sprintf("User asked for action but AI answered without tool, will retry (%d/%d)", attempt, maxRetries))
@@ -1248,6 +1639,15 @@ func processChatRequest(reqBody ChatRequest) ChatResponse {
 				upstreamMessages = append(upstreamMessages,
 					Message{Role: "assistant", Content: contentFromString(reply)},
 					Message{Role: "user", Content: correction("WRONG. You claimed you did something but you did NOT actually call any tool. Do NOT fabricate results. Use the appropriate tool NOW to actually complete the task. Call action: tool_call with the right tool.")},
+				)
+				continue
+			}
+			// Detect generic stop/progress update while the task still appears incomplete.
+			if attempt < maxRetries && conversationStillNeedsAction(reqBody.Messages) && answerLooksLikeProgressOnly(parsed.Content) {
+				logResult("⚠️", fmt.Sprintf("Task appears incomplete but answer stopped early, will retry (%d/%d)", attempt, maxRetries))
+				upstreamMessages = append(upstreamMessages,
+					Message{Role: "assistant", Content: contentFromString(reply)},
+					Message{Role: "user", Content: correction("WRONG. The task is not fully completed yet. Do not stop with a progress update, status message, generic reference, or partial completion. Infer the next missing step from the conversation history and recent tool results, then do that next step now.")},
 				)
 				continue
 			}
@@ -1368,7 +1768,8 @@ Available tools: %s
 
 To give final answer:
 action: answer
-content: your answer here
+content: |
+  your answer here
 
 Do NOT invent actions like "exec", "run", "execute". Respond NOW correctly.`, parsed.Action, strings.Join(validNames, ", "))
 			upstreamMessages = append(upstreamMessages,
@@ -1478,6 +1879,29 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			logResult("📎", fmt.Sprintf("Tool result [%s]: %s", msg.Name, content))
 		}
+	}
+
+	if len(reqBody.Tools) == 0 {
+		status, headers, respBody, err := proxyUpstreamRaw(body)
+		if err != nil {
+			logFooter(time.Since(start), "error")
+			sendJSON(w, map[string]string{"error": "Upstream request failed: " + err.Error()}, http.StatusBadGateway)
+			return
+		}
+		logResult("↪", fmt.Sprintf("Passthrough upstream response (%d)", status))
+		logFooter(time.Since(start), "passthrough")
+
+		for k, values := range headers {
+			if strings.EqualFold(k, "Content-Length") {
+				continue
+			}
+			for _, v := range values {
+				w.Header().Add(k, v)
+			}
+		}
+		w.WriteHeader(status)
+		w.Write(respBody)
+		return
 	}
 
 	result := processChatRequest(reqBody)
