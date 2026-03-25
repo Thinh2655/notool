@@ -1,6 +1,6 @@
 + giải thích ảnh
 + viết code
 + viết và gửi file
-- search
++ search
 + thực thi lệnh 
 + 
