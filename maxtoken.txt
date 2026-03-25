@@ -1,2 +1,3 @@
 gpt-free:~6000
-gpt-go:~28000
+gpt-go:~30680
+gpt-plus:~30680

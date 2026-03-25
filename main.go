@@ -28,6 +28,7 @@ type Config struct {
 	PlannerModel       string
 	ProxyPort          string
 	MaxTokens          int
+	MaxRequestBytes    int
 	PlannerMaxAttempts int
 	ExecutorMaxRetries int
 	HTTPTimeout        time.Duration
@@ -242,6 +243,21 @@ type executorPayload struct {
 	CurrentStep       executorStepView    `json:"current_step"`
 }
 
+type compactionProfile struct {
+	TargetTokens    int
+	TargetBytes     int
+	RecentMessages  int
+	SystemLimit     int
+	LatestUserLimit int
+	UserLimit       int
+	AssistantLimit  int
+	ToolLimit       int
+	ToolArgLimit    int
+	PreviewLimit    int
+	SummaryLines    int
+	SummaryLimit    int
+}
+
 func loadEnv(path string) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -295,6 +311,7 @@ func initConfig() {
 		PlannerModel:       getEnv("PLANNER_MODEL", ""),
 		ProxyPort:          getEnv("PROXY_PORT", "8880"),
 		MaxTokens:          getEnvInt("MAX_TOKENS", 30000),
+		MaxRequestBytes:    getEnvInt("MAX_REQUEST_BYTES", 180000),
 		PlannerMaxAttempts: getEnvInt("PLANNER_MAX_ATTEMPTS", 3),
 		ExecutorMaxRetries: getEnvInt("EXECUTOR_MAX_RETRIES", 6),
 		HTTPTimeout:        300 * time.Second,
@@ -326,112 +343,365 @@ func estimateTokens(text string) int {
 	return len(text) / 4
 }
 
-func truncateMessages(messages []Message) []Message {
-	if cfg.MaxTokens <= 0 {
-		return messages
+func maxInt(a, b int) int {
+	if a > b {
+		return a
 	}
-	total := 0
-	for _, msg := range messages {
-		total += estimateTokens(msg.ContentString())
-	}
-	if total <= cfg.MaxTokens {
-		return messages
-	}
+	return b
+}
 
-	result := make([]Message, len(messages))
-	copy(result, messages)
-	for i := 0; i < len(result) && total > cfg.MaxTokens; i++ {
-		if result[i].Role == "system" || result[i].ContentIsNull() {
-			continue
-		}
-		text := strings.TrimSpace(result[i].ContentString())
-		if len(text) < 300 {
-			continue
-		}
-		maxChars := len(text) / 2
-		if maxChars < 200 {
-			maxChars = 200
-		}
-		truncated := text[:maxChars] + "\n...[truncated]"
-		total -= estimateTokens(text) - estimateTokens(truncated)
-		result[i].Content = contentFromString(truncated)
+func compactText(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	return summarizeText(normalizeMultilineText(text), limit)
+}
+
+func compactInlineText(text string, limit int) string {
+	text = strings.Join(strings.Fields(normalizeMultilineText(text)), " ")
+	return compactText(text, limit)
+}
+
+func compactToolCallArguments(raw string, limit int) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	return compactInlineText(formatToolCallArguments(raw), limit)
+}
+
+func compactToolCalls(calls []ToolCall, limit int) []ToolCall {
+	if len(calls) == 0 {
+		return nil
+	}
+	result := make([]ToolCall, 0, len(calls))
+	for _, call := range calls {
+		result = append(result, ToolCall{
+			ID:   strings.TrimSpace(call.ID),
+			Type: strings.TrimSpace(call.Type),
+			Function: FunctionCall{
+				Name:      strings.TrimSpace(call.Function.Name),
+				Arguments: compactToolCallArguments(call.Function.Arguments, limit),
+			},
+		})
 	}
 	return result
 }
 
-func callUpstreamText(model string, messages []Message) (string, error) {
-	payload := map[string]interface{}{
-		"model":       resolvedChatModel(model),
-		"messages":    truncateMessages(messages),
-		"stream":      false,
-		"temperature": 0,
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest(http.MethodPost, cfg.UpstreamURL, bytes.NewReader(body))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if cfg.UpstreamAPIKey != "" {
-		req.Header.Set("Authorization", "Bearer "+cfg.UpstreamAPIKey)
-	}
-
-	client := &http.Client{Timeout: cfg.HTTPTimeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("upstream returned status %d: %s", resp.StatusCode, string(data))
-	}
-
-	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
-		var raw map[string]interface{}
-		if err := json.Unmarshal(data, &raw); err == nil {
-			if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
-				if choice, ok := choices[0].(map[string]interface{}); ok {
-					if msg, ok := choice["message"].(map[string]interface{}); ok {
-						if content, ok := msg["content"].(string); ok {
-							return content, nil
-						}
-					}
-				}
-			}
+func estimateMessageTokens(messages []Message, toolArgLimit int) int {
+	total := 0
+	for _, msg := range messages {
+		total += estimateTokens(msg.ContentString())
+		for _, call := range msg.ToolCalls {
+			total += estimateTokens(strings.TrimSpace(call.Function.Name))
+			total += estimateTokens(compactToolCallArguments(call.Function.Arguments, toolArgLimit))
 		}
 	}
-
-	var fullText strings.Builder
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "data: ") {
-			continue
-		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-		if payload == "[DONE]" {
-			break
-		}
-		var chunk upstreamResponse
-		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
-			continue
-		}
-		if len(chunk.Choices) > 0 {
-			fullText.WriteString(chunk.Choices[0].Delta.Content)
-		}
-	}
-	if fullText.Len() > 0 {
-		return fullText.String(), nil
-	}
-	return string(data), nil
+	return total
 }
 
-func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
+func estimateMessageBytes(messages []Message) int {
+	body, err := json.Marshal(messages)
+	if err != nil {
+		return 0
+	}
+	return len(body)
+}
+
+func compactionProfileForAttempt(attempt int) compactionProfile {
+	switch attempt {
+	case 0:
+		return compactionProfile{
+			TargetTokens:    cfg.MaxTokens,
+			TargetBytes:     cfg.MaxRequestBytes,
+			RecentMessages:  18,
+			SystemLimit:     8000,
+			LatestUserLimit: 6000,
+			UserLimit:       3000,
+			AssistantLimit:  2400,
+			ToolLimit:       1800,
+			ToolArgLimit:    900,
+			PreviewLimit:    220,
+			SummaryLines:    8,
+			SummaryLimit:    2200,
+		}
+	case 1:
+		return compactionProfile{
+			TargetTokens:    maxInt(6000, cfg.MaxTokens*3/4),
+			TargetBytes:     maxInt(64000, cfg.MaxRequestBytes*3/4),
+			RecentMessages:  12,
+			SystemLimit:     4500,
+			LatestUserLimit: 4000,
+			UserLimit:       1800,
+			AssistantLimit:  1400,
+			ToolLimit:       900,
+			ToolArgLimit:    500,
+			PreviewLimit:    180,
+			SummaryLines:    6,
+			SummaryLimit:    1600,
+		}
+	case 2:
+		return compactionProfile{
+			TargetTokens:    maxInt(4000, cfg.MaxTokens/2),
+			TargetBytes:     maxInt(32000, cfg.MaxRequestBytes/2),
+			RecentMessages:  8,
+			SystemLimit:     2600,
+			LatestUserLimit: 2400,
+			UserLimit:       1000,
+			AssistantLimit:  750,
+			ToolLimit:       500,
+			ToolArgLimit:    320,
+			PreviewLimit:    140,
+			SummaryLines:    5,
+			SummaryLimit:    1100,
+		}
+	default:
+		return compactionProfile{
+			TargetTokens:    maxInt(2500, cfg.MaxTokens/3),
+			TargetBytes:     maxInt(20000, cfg.MaxRequestBytes/3),
+			RecentMessages:  5,
+			SystemLimit:     1800,
+			LatestUserLimit: 1600,
+			UserLimit:       520,
+			AssistantLimit:  420,
+			ToolLimit:       280,
+			ToolArgLimit:    180,
+			PreviewLimit:    110,
+			SummaryLines:    4,
+			SummaryLimit:    750,
+		}
+	}
+}
+
+func messageContentLimit(msg Message, index, latestUserIdx int, profile compactionProfile) int {
+	role := strings.TrimSpace(msg.Role)
+	switch role {
+	case "system":
+		return profile.SystemLimit
+	case "tool":
+		return profile.ToolLimit
+	case "user":
+		if index == latestUserIdx {
+			return profile.LatestUserLimit
+		}
+		return profile.UserLimit
+	default:
+		return profile.AssistantLimit
+	}
+}
+
+func compactMessage(msg Message, index, latestUserIdx int, profile compactionProfile) Message {
+	result := Message{
+		Role: strings.TrimSpace(msg.Role),
+		Name: strings.TrimSpace(msg.Name),
+	}
+	if len(msg.Content) > 0 {
+		text := strings.TrimSpace(msg.ContentString())
+		if text != "" {
+			limit := messageContentLimit(msg, index, latestUserIdx, profile)
+			if limit > 0 {
+				result.Content = contentFromString(compactText(text, limit))
+			} else {
+				result.Content = msg.Content
+			}
+		} else if !msg.ContentIsNull() {
+			result.Content = msg.Content
+		}
+	}
+	if len(msg.ToolCalls) > 0 {
+		result.ToolCalls = compactToolCalls(msg.ToolCalls, profile.ToolArgLimit)
+	}
+	return result
+}
+
+func messagePreviewLine(msg Message, profile compactionProfile) string {
+	role := strings.TrimSpace(msg.Role)
+	if role == "" {
+		role = "message"
+	}
+	if name := strings.TrimSpace(msg.Name); name != "" && role == "tool" {
+		role += " (" + name + ")"
+	}
+
+	var parts []string
+	if text := strings.TrimSpace(msg.ContentString()); text != "" {
+		parts = append(parts, compactInlineText(text, profile.PreviewLimit))
+	}
+	if len(msg.ToolCalls) > 0 {
+		calls := make([]string, 0, len(msg.ToolCalls))
+		for _, call := range msg.ToolCalls {
+			summary := strings.TrimSpace(call.Function.Name)
+			if args := compactToolCallArguments(call.Function.Arguments, profile.ToolArgLimit); args != "" {
+				summary += " " + args
+			}
+			calls = append(calls, summary)
+		}
+		if len(calls) > 0 {
+			parts = append(parts, "tool_calls: "+strings.Join(calls, "; "))
+		}
+	}
+	joined := strings.Join(parts, " | ")
+	if strings.TrimSpace(joined) == "" {
+		joined = "<empty>"
+	}
+	return role + ": " + compactInlineText(joined, profile.PreviewLimit)
+}
+
+func buildCondensedMessage(omitted []Message, profile compactionProfile) (Message, bool) {
+	if len(omitted) == 0 {
+		return Message{}, false
+	}
+
+	lines := make([]string, 0, len(omitted))
+	start := 0
+	if len(omitted) > profile.SummaryLines {
+		start = len(omitted) - profile.SummaryLines
+	}
+	for _, msg := range omitted[start:] {
+		lines = append(lines, "- "+messagePreviewLine(msg, profile))
+	}
+	text := fmt.Sprintf(
+		"[Earlier context condensed by proxy to stay under upstream limits. %d message(s) abbreviated.]\n%s",
+		len(omitted),
+		strings.Join(lines, "\n"),
+	)
+	return Message{
+		Role:    "assistant",
+		Content: contentFromString(compactText(text, profile.SummaryLimit)),
+	}, true
+}
+
+func aggressivelyTrimMessages(messages []Message, profile compactionProfile) []Message {
+	if profile.TargetTokens <= 0 {
+		return messages
+	}
+	result := make([]Message, len(messages))
+	copy(result, messages)
+
+	total := estimateMessageTokens(result, profile.ToolArgLimit)
+	if total <= profile.TargetTokens {
+		return result
+	}
+
+	latestUserIdx := latestUserIndex(result)
+	trimMessage := func(index int, minimum int) {
+		if index < 0 || index >= len(result) {
+			return
+		}
+		text := strings.TrimSpace(result[index].ContentString())
+		if len(text) <= minimum {
+			return
+		}
+		nextLimit := len(text) / 2
+		if nextLimit < minimum {
+			nextLimit = minimum
+		}
+		trimmed := compactText(text, nextLimit)
+		if trimmed == text || trimmed == "" {
+			return
+		}
+		total -= estimateTokens(text) - estimateTokens(trimmed)
+		result[index].Content = contentFromString(trimmed)
+	}
+
+	for i := 0; i < len(result) && total > profile.TargetTokens; i++ {
+		if i == latestUserIdx || strings.TrimSpace(result[i].Role) == "system" {
+			continue
+		}
+		trimMessage(i, 120)
+	}
+	if total > profile.TargetTokens && latestUserIdx >= 0 {
+		trimMessage(latestUserIdx, 220)
+	}
+	return result
+}
+
+func compactMessagesForProfile(messages []Message, profile compactionProfile) []Message {
+	if len(messages) == 0 {
+		return messages
+	}
+	if (profile.TargetTokens <= 0 || estimateMessageTokens(messages, profile.ToolArgLimit) <= profile.TargetTokens) &&
+		(profile.TargetBytes <= 0 || estimateMessageBytes(messages) <= profile.TargetBytes) {
+		return messages
+	}
+
+	latestUserIdx := latestUserIndex(messages)
+	preserve := make(map[int]bool, len(messages))
+	for i, msg := range messages {
+		if strings.TrimSpace(msg.Role) == "system" {
+			preserve[i] = true
+		}
+	}
+	if latestUserIdx >= 0 {
+		for i := latestUserIdx; i < len(messages); i++ {
+			preserve[i] = true
+		}
+	}
+	recent := 0
+	for i := len(messages) - 1; i >= 0 && recent < profile.RecentMessages; i-- {
+		if strings.TrimSpace(messages[i].Role) == "system" {
+			continue
+		}
+		if !preserve[i] {
+			recent++
+		}
+		preserve[i] = true
+	}
+
+	result := make([]Message, 0, len(messages))
+	var omitted []Message
+	flushSummary := func() {
+		if summary, ok := buildCondensedMessage(omitted, profile); ok {
+			result = append(result, summary)
+		}
+		omitted = nil
+	}
+
+	for i, msg := range messages {
+		role := strings.TrimSpace(msg.Role)
+		if role == "" {
+			continue
+		}
+		if preserve[i] {
+			flushSummary()
+			result = append(result, compactMessage(msg, i, latestUserIdx, profile))
+			continue
+		}
+		omitted = append(omitted, msg)
+	}
+	flushSummary()
+	return aggressivelyTrimMessages(result, profile)
+}
+
+func truncateMessages(messages []Message) []Message {
+	return compactMessagesForProfile(messages, compactionProfileForAttempt(0))
+}
+
+func isContextLimitResponse(status int, data []byte) bool {
+	if status == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	body := strings.ToLower(string(data))
+	markers := []string{
+		"messagelengthexceeds_limit",
+		"maximum context",
+		"max context",
+		"context length",
+		"message length",
+		"prompt is too long",
+		"request too large",
+		"messages are too long",
+		"quá dài",
+	}
+	for _, marker := range markers {
+		if strings.Contains(body, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func doUpstreamRequest(body []byte) (int, http.Header, []byte, error) {
 	req, err := http.NewRequest(http.MethodPost, cfg.UpstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
@@ -460,6 +730,134 @@ func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
 		}
 	}
 	return resp.StatusCode, headers, data, nil
+}
+
+func callUpstreamText(model string, messages []Message) (string, error) {
+	const maxCompactionAttempts = 4
+
+	var lastErr error
+	for attempt := 0; attempt < maxCompactionAttempts; attempt++ {
+		profile := compactionProfileForAttempt(attempt)
+		currentMessages := messages
+		if attempt == 0 {
+			currentMessages = truncateMessages(messages)
+		} else {
+			currentMessages = compactMessagesForProfile(messages, profile)
+		}
+
+		payload := map[string]interface{}{
+			"model":       resolvedChatModel(model),
+			"messages":    currentMessages,
+			"stream":      false,
+			"temperature": 0,
+		}
+		body, _ := json.Marshal(payload)
+		if profile.TargetBytes > 0 && len(body) > profile.TargetBytes {
+			if attempt == maxCompactionAttempts-1 {
+				lastErr = fmt.Errorf("request body still too large after compaction: %d bytes", len(body))
+				break
+			}
+			logResult("⚠️", fmt.Sprintf("upstream payload %d bytes exceeds proxy budget %d; retrying with tighter context", len(body), profile.TargetBytes))
+			lastErr = fmt.Errorf("request body too large: %d bytes", len(body))
+			continue
+		}
+
+		status, headers, data, err := doUpstreamRequest(body)
+		if err != nil {
+			return "", err
+		}
+		if status != http.StatusOK {
+			lastErr = fmt.Errorf("upstream returned status %d: %s", status, string(data))
+			if isContextLimitResponse(status, data) && attempt < maxCompactionAttempts-1 {
+				logResult("⚠️", fmt.Sprintf("upstream rejected oversized context; retrying with tighter compaction (%d/%d)", attempt+2, maxCompactionAttempts))
+				continue
+			}
+			return "", lastErr
+		}
+
+		if strings.Contains(strings.ToLower(headers.Get("Content-Type")), "application/json") {
+			var raw map[string]interface{}
+			if err := json.Unmarshal(data, &raw); err == nil {
+				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+					if choice, ok := choices[0].(map[string]interface{}); ok {
+						if msg, ok := choice["message"].(map[string]interface{}); ok {
+							if content, ok := msg["content"].(string); ok {
+								return content, nil
+							}
+						}
+					}
+				}
+			}
+		}
+
+		var fullText strings.Builder
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			chunkPayload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+			if chunkPayload == "[DONE]" {
+				break
+			}
+			var chunk upstreamResponse
+			if err := json.Unmarshal([]byte(chunkPayload), &chunk); err != nil {
+				continue
+			}
+			if len(chunk.Choices) > 0 {
+				fullText.WriteString(chunk.Choices[0].Delta.Content)
+			}
+		}
+		if fullText.Len() > 0 {
+			return fullText.String(), nil
+		}
+		return string(data), nil
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("upstream request failed without a usable response")
+}
+
+func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
+	const maxCompactionAttempts = 4
+
+	var parsed ChatRequest
+	parseOK := json.Unmarshal(body, &parsed) == nil && len(parsed.Messages) > 0
+	lastStatus := 0
+	lastHeaders := make(http.Header)
+	var lastData []byte
+
+	for attempt := 0; attempt < maxCompactionAttempts; attempt++ {
+		currentBody := body
+		if parseOK {
+			profile := compactionProfileForAttempt(attempt)
+			if attempt > 0 || (profile.TargetBytes > 0 && len(body) > profile.TargetBytes) {
+				compactReq := parsed
+				compactReq.Messages = compactMessagesForProfile(parsed.Messages, profile)
+				currentBody, _ = json.Marshal(compactReq)
+			}
+			if profile.TargetBytes > 0 && len(currentBody) > profile.TargetBytes && attempt < maxCompactionAttempts-1 {
+				lastStatus = http.StatusRequestEntityTooLarge
+				lastData = []byte(fmt.Sprintf("request body too large after compaction: %d bytes", len(currentBody)))
+				log.Printf("raw upstream payload %d bytes exceeds proxy budget %d; retrying with tighter compaction", len(currentBody), profile.TargetBytes)
+				continue
+			}
+		}
+
+		status, headers, data, err := doUpstreamRequest(currentBody)
+		if err != nil {
+			return 0, nil, nil, err
+		}
+		lastStatus, lastHeaders, lastData = status, headers, data
+		if !parseOK || !isContextLimitResponse(status, data) || attempt == maxCompactionAttempts-1 {
+			return status, headers, data, nil
+		}
+		log.Printf("raw upstream rejected oversized context; retrying with tighter compaction (%d/%d)", attempt+2, maxCompactionAttempts)
+	}
+
+	return lastStatus, lastHeaders, lastData, nil
 }
 
 func requestHasTools(body []byte) (bool, error) {
@@ -521,16 +919,173 @@ func orderedToolSpecs(registry map[string]ToolSpec) []ToolSpec {
 	return specs
 }
 
+func compactConversationArgumentMap(arguments map[string]interface{}, limit int) map[string]interface{} {
+	if len(arguments) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(arguments))
+	for key := range arguments {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	result := make(map[string]interface{}, len(arguments))
+	for _, key := range keys {
+		result[key] = compactInlineText(fmt.Sprint(arguments[key]), limit)
+	}
+	return result
+}
+
+func compactConversationEntry(entry ConversationEntry, index, latestUserIdx int) ConversationEntry {
+	result := ConversationEntry{
+		Role: strings.TrimSpace(entry.Role),
+		Name: strings.TrimSpace(entry.Name),
+	}
+	limit := 900
+	switch result.Role {
+	case "system":
+		limit = 2500
+	case "tool":
+		limit = 700
+	case "user":
+		if index == latestUserIdx {
+			limit = 2200
+		} else {
+			limit = 1200
+		}
+	}
+	if strings.TrimSpace(entry.Content) != "" {
+		result.Content = compactText(entry.Content, limit)
+	}
+	if len(entry.ToolCalls) > 0 {
+		result.ToolCalls = make([]ConversationToolCall, 0, len(entry.ToolCalls))
+		for _, call := range entry.ToolCalls {
+			result.ToolCalls = append(result.ToolCalls, ConversationToolCall{
+				Name:      strings.TrimSpace(call.Name),
+				Arguments: compactConversationArgumentMap(call.Arguments, 220),
+			})
+		}
+	}
+	return result
+}
+
+func conversationPreviewLine(entry ConversationEntry) string {
+	role := strings.TrimSpace(entry.Role)
+	if role == "" {
+		role = "message"
+	}
+	if name := strings.TrimSpace(entry.Name); name != "" && role == "tool" {
+		role += " (" + name + ")"
+	}
+	var parts []string
+	if text := strings.TrimSpace(entry.Content); text != "" {
+		parts = append(parts, compactInlineText(text, 180))
+	}
+	if len(entry.ToolCalls) > 0 {
+		calls := make([]string, 0, len(entry.ToolCalls))
+		for _, call := range entry.ToolCalls {
+			summary := strings.TrimSpace(call.Name)
+			if len(call.Arguments) > 0 {
+				summary += " " + compactInlineText(formatArgumentMap(call.Arguments), 180)
+			}
+			calls = append(calls, summary)
+		}
+		if len(calls) > 0 {
+			parts = append(parts, "tool_calls: "+strings.Join(calls, "; "))
+		}
+	}
+	joined := strings.Join(parts, " | ")
+	if strings.TrimSpace(joined) == "" {
+		joined = "<empty>"
+	}
+	return role + ": " + compactInlineText(joined, 180)
+}
+
+func buildConversationSummaryEntry(entries []ConversationEntry) (ConversationEntry, bool) {
+	if len(entries) == 0 {
+		return ConversationEntry{}, false
+	}
+	lines := make([]string, 0, len(entries))
+	start := 0
+	if len(entries) > 6 {
+		start = len(entries) - 6
+	}
+	for _, entry := range entries[start:] {
+		lines = append(lines, "- "+conversationPreviewLine(entry))
+	}
+	text := fmt.Sprintf(
+		"[Earlier conversation condensed by proxy. %d message(s) abbreviated.]\n%s",
+		len(entries),
+		strings.Join(lines, "\n"),
+	)
+	return ConversationEntry{
+		Role:    "assistant",
+		Content: compactText(text, 1500),
+	}, true
+}
+
+func compactConversationEntries(entries []ConversationEntry) []ConversationEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+
+	latestUserIdx := -1
+	for i := len(entries) - 1; i >= 0; i-- {
+		if strings.TrimSpace(entries[i].Role) == "user" {
+			latestUserIdx = i
+			break
+		}
+	}
+
+	preserve := make(map[int]bool, len(entries))
+	for i, entry := range entries {
+		if strings.TrimSpace(entry.Role) == "system" {
+			preserve[i] = true
+		}
+	}
+	if latestUserIdx >= 0 {
+		for i := latestUserIdx; i < len(entries); i++ {
+			preserve[i] = true
+		}
+	}
+	recent := 0
+	for i := len(entries) - 1; i >= 0 && recent < 10; i-- {
+		if strings.TrimSpace(entries[i].Role) == "system" {
+			continue
+		}
+		if !preserve[i] {
+			recent++
+		}
+		preserve[i] = true
+	}
+
+	result := make([]ConversationEntry, 0, len(entries))
+	var omitted []ConversationEntry
+	flushSummary := func() {
+		if summary, ok := buildConversationSummaryEntry(omitted); ok {
+			result = append(result, summary)
+		}
+		omitted = nil
+	}
+
+	for i, entry := range entries {
+		if preserve[i] {
+			flushSummary()
+			result = append(result, compactConversationEntry(entry, i, latestUserIdx))
+			continue
+		}
+		omitted = append(omitted, entry)
+	}
+	flushSummary()
+	return result
+}
+
 func normalizeConversation(messages []Message) []ConversationEntry {
 	entries := make([]ConversationEntry, 0, len(messages))
 	for _, msg := range messages {
 		entry := ConversationEntry{Role: strings.TrimSpace(msg.Role), Name: strings.TrimSpace(msg.Name)}
 		if text := strings.TrimSpace(msg.ContentString()); text != "" {
-			if entry.Role == "system" {
-				entry.Content = text
-			} else {
-				entry.Content = summarizeText(text, 6000)
-			}
+			entry.Content = text
 		}
 		if len(msg.ToolCalls) > 0 {
 			entry.ToolCalls = make([]ConversationToolCall, 0, len(msg.ToolCalls))
@@ -553,7 +1108,7 @@ func normalizeConversation(messages []Message) []ConversationEntry {
 		}
 		entries = append(entries, entry)
 	}
-	return entries
+	return compactConversationEntries(entries)
 }
 
 func buildExecutionTrace(messages []Message) []executionTraceEntry {
@@ -574,7 +1129,7 @@ func buildExecutionTrace(messages []Message) []executionTraceEntry {
 				trace = append(trace, executionTraceEntry{
 					Kind:    "tool_call",
 					Tool:    strings.TrimSpace(call.Function.Name),
-					Summary: summarizeText(summary, 500),
+					Summary: compactInlineText(summary, 260),
 				})
 			}
 		case "tool":
@@ -585,9 +1140,15 @@ func buildExecutionTrace(messages []Message) []executionTraceEntry {
 			trace = append(trace, executionTraceEntry{
 				Kind:    "tool_result",
 				Tool:    strings.TrimSpace(msg.Name),
-				Summary: summarizeText(result, 1200),
+				Summary: compactText(result, 700),
 			})
 		}
+	}
+	if len(trace) > 8 {
+		trace = append([]executionTraceEntry{{
+			Kind:    "summary",
+			Summary: fmt.Sprintf("Earlier %d execution item(s) were condensed by the proxy.", len(trace)-8),
+		}}, trace[len(trace)-8:]...)
 	}
 	return trace
 }
@@ -964,15 +1525,18 @@ func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
 	sb.WriteString("Preferred wrapper: ```toon ... ```; fallback wrapper: ``` ... ```.\n")
 	sb.WriteString("Never output JSON, tool arguments, URLs list, prose explanation, or direct answer text outside the toon block.\n")
 	sb.WriteString("System messages in the conversation override identity, tone, and language.\n")
-	sb.WriteString("If system requires Vietnamese, final must be Vietnamese.\n\n")
-	sb.WriteString("Only two valid block shapes exist:\n")
+	sb.WriteString("If system requires Vietnamese, any final line must be Vietnamese.\n\n")
+	sb.WriteString("Valid block shapes:\n")
 	sb.WriteString("```toon\nfinal: <one-line answer preview>\n```\n")
 	sb.WriteString("or\n")
-	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\nfinal: <one-line answer preview if this step succeeds>\n```\n\n")
+	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\n```\n")
+	sb.WriteString("or\n")
+	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\nfinal: <optional one-line answer preview if this step succeeds>\n```\n\n")
 	sb.WriteString("Controller rules:\n")
 	sb.WriteString("- Decide only the next immediate action. Never output step 2 or later.\n")
 	sb.WriteString("- Use execution_trace from the current request to decide what should happen next.\n")
 	sb.WriteString("- If the goal is already satisfied by the existing tool results, return final only.\n")
+	sb.WriteString("- If more tool work is still needed, `step 1 + note` without any `final:` line is valid and means continue execution.\n")
 	sb.WriteString("- If a previous tool result is missing information needed for later steps, choose the discovery/inspection step now.\n")
 	sb.WriteString("- If a previous tool result failed to produce the needed artifact or evidence, do not pretend success; choose the next corrective step or end with a truthful final.\n")
 	sb.WriteString("- Do not repeat the same discovery/inspection step if execution_trace already contains enough information to move forward.\n")
@@ -988,7 +1552,7 @@ func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
 	sb.WriteString("- note must include use=, why=, output=. input= is optional but should include the key tool input when it is already known.\n")
 	sb.WriteString("- never put command, path, url, query, content, or input on a separate line.\n")
 	sb.WriteString("- do not output argument JSON like {\"query\":...}; controller chooses the tool only, executor will produce arguments later.\n")
-	sb.WriteString("- final must be the last toon line, one short line, with no bullets, links, URLs, citations, or extra lines after it.\n")
+	sb.WriteString("- if `final:` is present, it must be the last toon line, one short line, with no bullets, links, URLs, citations, or extra lines after it.\n")
 	sb.WriteString("- if a tool could still usefully advance the request, do not jump to final.\n")
 	sb.WriteString("- never invent tools, paths, URLs, contents, or claim work is already done unless execution_trace proves it.\n")
 	sb.WriteString("- Before outputting, ask yourself: what is the one best next move right now?\n")
@@ -1013,14 +1577,14 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	sb.WriteString(fmt.Sprintf("Retry=%d.\n", retryNumber))
 	sb.WriteString("Rewrite the whole next-action block from scratch.\n")
 	sb.WriteString("Return one fenced toon block only: prefer ```toon ... ```, fallback ``` ... ```.\n")
-	sb.WriteString("Obey system-message persona/language. If system requires Vietnamese, final must be Vietnamese.\n")
+	sb.WriteString("Obey system-message persona/language. If system requires Vietnamese, any final line must be Vietnamese.\n")
 	sb.WriteString("Must obey:\n")
-	sb.WriteString("- inside the block: final only, OR exactly one `step 1` + one `note:` + final.\n")
+	sb.WriteString("- inside the block: final only, OR exactly one `step 1` + one `note:`, with optional `final:` preview.\n")
 	sb.WriteString("- no JSON, no prose outside the block.\n")
 	sb.WriteString("- decide only the immediate next action; never output step 2 or later.\n")
 	sb.WriteString("- use execution_trace to decide what should happen now.\n")
 	sb.WriteString("- note is one line only; never put input, command, path, url, query, or content on a new line.\n")
-	sb.WriteString("- final is one short line only; no bullets/links/URLs after it.\n")
+	sb.WriteString("- if `final:` is present, it is one short line only; no bullets/links/URLs after it.\n")
 	sb.WriteString("- exact tool names only: " + strings.Join(orderedToolNames(registry), ", ") + "\n")
 	sb.WriteString("- no invented tools, paths, URLs, contents, or results.\n")
 	sb.WriteString("- do not claim success unless execution_trace already proves it.\n")
@@ -1029,7 +1593,7 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	sb.WriteString("- HARD BAN: no outbound communication tool for current-chat reply, confirmation, or summary.\n")
 	sb.WriteString("- use message only for explicit outbound delivery to another recipient/channel.\n")
 	sb.WriteString("- send_file is valid only when the artifact already exists or execution_trace strongly shows it was created.\n")
-	sb.WriteString("- VALID pattern: one next step -> final preview, OR final only.\n")
+	sb.WriteString("- VALID pattern: one next step without final, one next step with optional final preview, OR final only.\n")
 	sb.WriteString("- INVALID pattern: step 1 -> step 2 -> final.\n")
 	sb.WriteString("Fix every issue below:\n")
 	for _, issue := range issues {
@@ -1040,7 +1604,7 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 }
 
 func plannerPrimerMessage() string {
-	return "Understood. I will return one fenced toon block only. I will decide only the immediate next action from the latest execution trace, or final if the goal is already satisfied."
+	return "Understood. I will return one fenced toon block only. I will decide only the immediate next action from the latest execution trace, using either final only or step 1 plus note, with final optional when work should continue."
 }
 
 func planLineIssueForExtraLine(stepNumber int, line string, lineIndex int) string {
@@ -1220,13 +1784,14 @@ func parseToonPlan(raw string, registry map[string]ToolSpec) (ToonPlan, []string
 
 func validateToonPlan(plan ToonPlan, messages []Message, registry map[string]ToolSpec) []string {
 	var issues []string
-	if plan.Final == "" {
-		issues = append(issues, "last line must be `final: <answer>`")
-	}
 	if len(plan.Steps) > 1 {
 		issues = append(issues, "controller must return only the immediate next step, not multiple future steps")
 	}
 	if len(plan.Steps) == 0 {
+		if plan.Final == "" {
+			issues = append(issues, "planner must return either at least one tool step or a `final:` line")
+			return issues
+		}
 		if latestRequestLikelyNeedsTool(messages) && !hasToolActivityAfterLatestUser(messages) && !isSimpleConversationRequest(messages) {
 			issues = append(issues, "latest request likely still needs a tool, so planner cannot jump directly to final")
 		}
@@ -1844,6 +2409,7 @@ func main() {
 	if strings.TrimSpace(cfg.PlannerModel) != "" {
 		fmt.Printf("  Planner model:  %s\n", cfg.PlannerModel)
 	}
+	fmt.Printf("  Max req bytes:  %d\n", cfg.MaxRequestBytes)
 	fmt.Printf("  Planner retry:  %d\n", cfg.PlannerMaxAttempts)
 	fmt.Printf("  Executor retry: %d\n", cfg.ExecutorMaxRetries)
 	fmt.Println()
