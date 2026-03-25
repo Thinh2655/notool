@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,71 +12,45 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
-	toon "github.com/toon-format/toon-go"
 )
 
-// ============================================================
-// Config (loaded from .env file)
-// ============================================================
-var (
-	UpstreamURL    string
-	UpstreamAPIKey string
-	UpstreamModel  string
-	ProxyPort      string
-	MaxTokens      int
-)
-
-func loadEnv(filename string) {
-	f, err := os.Open(filename)
-	if err != nil {
-		log.Printf("Warning: could not open %s: %v", filename, err)
-		return
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		// OS env takes precedence over .env file
-		if os.Getenv(key) == "" {
-			os.Setenv(key, value)
-		}
-	}
+type Config struct {
+	UpstreamURL        string
+	UpstreamAPIKey     string
+	UpstreamModel      string
+	PlannerModel       string
+	ProxyPort          string
+	MaxTokens          int
+	PlannerMaxAttempts int
+	ExecutorMaxRetries int
+	HTTPTimeout        time.Duration
 }
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
+var cfg Config
+
+type activePlanState struct {
+	Key       string
+	Plan      ToonPlan
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
-func initConfig() {
-	loadEnv(".env")
-	UpstreamURL = getEnv("UPSTREAM_URL", "http://localhost:5005/v1/chat/completions")
-	UpstreamAPIKey = getEnv("UPSTREAM_API_KEY", "")
-	UpstreamModel = getEnv("UPSTREAM_MODEL", "grok-4")
-	ProxyPort = getEnv("PROXY_PORT", "8880")
-	MaxTokens, _ = strconv.Atoi(getEnv("MAX_TOKENS", "30000"))
+type activePlanStore struct {
+	mu    sync.Mutex
+	items map[string]activePlanState
 }
 
-// ============================================================
-// Types
-// ============================================================
+var planStore = activePlanStore{
+	items: map[string]activePlanState{},
+}
+
 type Message struct {
 	Role      string          `json:"role"`
 	Content   json.RawMessage `json:"content,omitempty"`
@@ -82,136 +58,36 @@ type Message struct {
 	ToolCalls []ToolCall      `json:"tool_calls,omitempty"`
 }
 
-// Helper to get content as string (handles both string and array formats)
 func (m Message) ContentString() string {
 	if len(m.Content) == 0 {
 		return ""
 	}
-	// Try string first
-	var s string
-	if err := json.Unmarshal(m.Content, &s); err == nil {
-		return s
+	var text string
+	if err := json.Unmarshal(m.Content, &text); err == nil {
+		return text
 	}
-	// Try array of content parts [{type: "text", text: "..."}, {type: "image_url", ...}]
 	var parts []map[string]interface{}
 	if err := json.Unmarshal(m.Content, &parts); err == nil {
-		var texts []string
-		for _, p := range parts {
-			if p["type"] == "text" {
-				if t, ok := p["text"].(string); ok {
-					texts = append(texts, t)
+		var chunks []string
+		for _, part := range parts {
+			if part["type"] == "text" {
+				if value, ok := part["text"].(string); ok {
+					chunks = append(chunks, value)
 				}
 			}
-			if p["type"] == "image_url" {
-				texts = append(texts, "[image]")
-			}
 		}
-		return strings.Join(texts, "\n")
+		return strings.Join(chunks, "\n")
 	}
 	return string(m.Content)
 }
 
-// Helper to check if content is null/empty
 func (m Message) ContentIsNull() bool {
 	return len(m.Content) == 0 || string(m.Content) == "null"
 }
 
-// Helper to create content from string
 func contentFromString(s string) json.RawMessage {
-	b, _ := json.Marshal(s)
-	return b
-}
-
-func fencedToon(body string) string {
-	body = strings.TrimSpace(body)
-	return "```toon\n" + body + "\n```"
-}
-
-func decodeEscapedAnswerContent(s string) string {
-	s = strings.ReplaceAll(s, "\\r\\n", "\n")
-	s = strings.ReplaceAll(s, "\\n", "\n")
-	return s
-}
-
-func decodeTOONScalar(s string) string {
-	s = strings.TrimSpace(s)
-	if len(s) >= 2 {
-		if unquoted, err := strconv.Unquote(s); err == nil {
-			return unquoted
-		}
-	}
-	return s
-}
-
-func stripOneIndentLevel(line string) string {
-	line = strings.TrimRight(line, "\r")
-	switch {
-	case strings.HasPrefix(line, "  "):
-		return line[2:]
-	case strings.HasPrefix(line, "\t"):
-		return line[1:]
-	default:
-		return line
-	}
-}
-
-var toonReminder = "\n\n--- REMEMBER THE CORRECT FORMAT ---\n" +
-	"Respond with EXACTLY ONE fenced ```toon block and nothing else.\n" +
-	"The block must contain ONLY the single immediate next step based on the conversation history.\n" +
-	"Never include a full plan or multiple steps in one response.\n\n" +
-	"To call a tool:\n" +
-	fencedToon("action: tool_call\nname: TOOL_NAME\narguments:\n  param: value") +
-	"\n\nTo give final answer:\n" +
-	fencedToon("action: answer\ncontent: |\n  line 1\n  line 2") +
-	"\n\nFor answer blocks, use `content: |` and indent the content body with 2 spaces."
-
-// correction creates a correction message with TOON format reminder appended.
-func correction(msg string) json.RawMessage {
-	return contentFromString(msg + toonReminder)
-}
-
-// escalatedCorrection returns a progressively stronger correction based on attempt number.
-func escalatedCorrection(attempt int, baseMsg string, toolName string, args map[string]string) json.RawMessage {
-	switch {
-	case attempt <= 2:
-		// Level 1-2: polite correction with format reminder
-		return correction(baseMsg)
-
-	case attempt <= 4:
-		// Level 3-4: stern, with exact example
-		var example strings.Builder
-		example.WriteString(fmt.Sprintf("STOP making mistakes. This is attempt %d.\n\n", attempt))
-		example.WriteString(baseMsg)
-		if toolName != "" {
-			example.WriteString("\n\nCopy this EXACTLY as ONE ```toon block and fill in values:\n```toon\n")
-			example.WriteString("action: tool_call\n")
-			example.WriteString(fmt.Sprintf("name: %s\narguments:\n", toolName))
-			for k, v := range args {
-				example.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
-			}
-			example.WriteString("```")
-		}
-		return correction(example.String())
-
-	default:
-		// Level 5+: maximum force, strip everything, just give the template
-		var force strings.Builder
-		force.WriteString(fmt.Sprintf("ATTEMPT %d. YOUR PREVIOUS %d RESPONSES WERE ALL WRONG.\n\n", attempt, attempt-1))
-		force.WriteString("IGNORE everything you think you know. You are NOT limited. You HAVE tools.\n\n")
-		if toolName != "" {
-			force.WriteString("RESPOND WITH EXACTLY ONE ```toon BLOCK (replace VALUE with real data):\n```toon\n")
-			force.WriteString("action: tool_call\n")
-			force.WriteString(fmt.Sprintf("name: %s\n", toolName))
-			force.WriteString("arguments:\n")
-			for k, v := range args {
-				force.WriteString(fmt.Sprintf("  %s: %s\n", k, v))
-			}
-			force.WriteString("```\n\nNOTHING ELSE. No text before. No text after. Just this single block.")
-		} else {
-			force.WriteString(baseMsg)
-		}
-		return contentFromString(force.String())
-	}
+	raw, _ := json.Marshal(s)
+	return raw
 }
 
 type ToolCall struct {
@@ -285,87 +161,221 @@ type upstreamResponse struct {
 	} `json:"choices"`
 }
 
-type toolCallWrapper struct {
-	ToolCall *toolCallParsed `json:"tool_call"`
+type ToolSpec struct {
+	Name        string               `json:"name"`
+	Description string               `json:"description,omitempty"`
+	Required    []string             `json:"required,omitempty"`
+	Parameters  map[string]ParamInfo `json:"parameters,omitempty"`
 }
 
-type toolCallParsed struct {
+type ConversationEntry struct {
+	Role      string                 `json:"role"`
+	Name      string                 `json:"name,omitempty"`
+	Content   string                 `json:"content,omitempty"`
+	ToolCalls []ConversationToolCall `json:"tool_calls,omitempty"`
+}
+
+type ConversationToolCall struct {
+	Name      string                 `json:"name"`
+	Arguments map[string]interface{} `json:"arguments,omitempty"`
+}
+
+type PlanNote struct {
+	Raw    string `json:"-"`
+	Use    string `json:"use"`
+	Why    string `json:"why"`
+	Output string `json:"output"`
+	Input  string `json:"input,omitempty"`
+}
+
+func (n PlanNote) String() string {
+	parts := []string{"use=" + n.Use, "why=" + n.Why, "output=" + n.Output}
+	if strings.TrimSpace(n.Input) != "" {
+		parts = append(parts, "input="+n.Input)
+	}
+	return strings.Join(parts, "; ")
+}
+
+type ToonStep struct {
+	Number int      `json:"number"`
+	Tool   string   `json:"tool"`
+	Note   PlanNote `json:"note"`
+}
+
+type ToonPlan struct {
+	Raw         string     `json:"raw"`
+	Steps       []ToonStep `json:"steps"`
+	Final       string     `json:"final"`
+	DirectFinal bool       `json:"direct_final"`
+}
+
+type plannerPayload struct {
+	LatestUserRequest string              `json:"latest_user_request,omitempty"`
+	Conversation      []ConversationEntry `json:"conversation"`
+	AvailableTools    []ToolSpec          `json:"available_tools"`
+}
+
+type executorStepView struct {
+	Type   string   `json:"type"`
+	Number int      `json:"number,omitempty"`
+	Tool   string   `json:"tool,omitempty"`
+	Note   PlanNote `json:"note,omitempty"`
+}
+
+type executorPlanView struct {
+	Steps []executorStepView `json:"steps,omitempty"`
+	Final string             `json:"final"`
+}
+
+type executorPayload struct {
+	LatestUserRequest string              `json:"latest_user_request,omitempty"`
+	Conversation      []ConversationEntry `json:"conversation"`
+	AvailableTools    []ToolSpec          `json:"available_tools,omitempty"`
+	Plan              executorPlanView    `json:"plan"`
+	CurrentStep       executorStepView    `json:"current_step"`
+}
+
+type executorToolCall struct {
+	Action    string                 `json:"action"`
 	Name      string                 `json:"name"`
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
-// Unified response from model - supports both TOON and JSON
-type modelResponse struct {
-	Action    string                 `json:"action"    toon:"action"`
-	Name      string                 `json:"name,omitempty"    toon:"name"`
-	Arguments map[string]interface{} `json:"arguments,omitempty" toon:"arguments"`
-	Content   string                 `json:"content,omitempty"  toon:"content"`
+func loadEnv(path string) {
+	file, err := os.Open(path)
+	if err != nil {
+		log.Printf("Warning: could not open %s: %v", path, err)
+		return
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		if os.Getenv(key) == "" {
+			os.Setenv(key, value)
+		}
+	}
 }
 
-// ============================================================
-// Upstream model communication
-// ============================================================
-func estimateTokens(s string) int {
-	return len(s) / 4
+func getEnv(key, fallback string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return fallback
+	}
+	number, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return number
+}
+
+func initConfig() {
+	loadEnv(".env")
+	cfg = Config{
+		UpstreamURL:        getEnv("UPSTREAM_URL", "http://localhost:5005/v1/chat/completions"),
+		UpstreamAPIKey:     getEnv("UPSTREAM_API_KEY", ""),
+		UpstreamModel:      getEnv("UPSTREAM_MODEL", "grok-4"),
+		PlannerModel:       getEnv("PLANNER_MODEL", ""),
+		ProxyPort:          getEnv("PROXY_PORT", "8880"),
+		MaxTokens:          getEnvInt("MAX_TOKENS", 30000),
+		PlannerMaxAttempts: getEnvInt("PLANNER_MAX_ATTEMPTS", 3),
+		ExecutorMaxRetries: getEnvInt("EXECUTOR_MAX_RETRIES", 6),
+		HTTPTimeout:        300 * time.Second,
+	}
+	if cfg.PlannerMaxAttempts < 1 {
+		cfg.PlannerMaxAttempts = 1
+	}
+	if cfg.ExecutorMaxRetries < 1 {
+		cfg.ExecutorMaxRetries = 1
+	}
+}
+
+func resolvedChatModel(requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested != "" {
+		return requested
+	}
+	return cfg.UpstreamModel
+}
+
+func resolvedPlannerModel(requested string) string {
+	if strings.TrimSpace(cfg.PlannerModel) != "" {
+		return strings.TrimSpace(cfg.PlannerModel)
+	}
+	return resolvedChatModel(requested)
+}
+
+func estimateTokens(text string) int {
+	return len(text) / 4
 }
 
 func truncateMessages(messages []Message) []Message {
-	if MaxTokens <= 0 {
+	if cfg.MaxTokens <= 0 {
 		return messages
 	}
-
 	total := 0
-	for _, m := range messages {
-		if !m.ContentIsNull() {
-			total += estimateTokens(m.ContentString())
-		}
+	for _, msg := range messages {
+		total += estimateTokens(msg.ContentString())
 	}
-	if total <= MaxTokens {
+	if total <= cfg.MaxTokens {
 		return messages
 	}
 
-	// Keep system (first) and latest messages, truncate middle content
 	result := make([]Message, len(messages))
 	copy(result, messages)
-
-	// Truncate from oldest non-system messages
-	for i := range result {
-		if result[i].Role == "system" || total <= MaxTokens {
+	for i := 0; i < len(result) && total > cfg.MaxTokens; i++ {
+		if result[i].Role == "system" || result[i].ContentIsNull() {
 			continue
 		}
-		if !result[i].ContentIsNull() {
-			contentTokens := estimateTokens(result[i].ContentString())
-			maxChars := MaxTokens * 4 / len(messages)
-			contentStr := result[i].ContentString()
-			if len(contentStr) > maxChars {
-				truncated := contentStr[:maxChars] + "\n...[truncated]"
-				result[i].Content = contentFromString(truncated)
-				total -= contentTokens - estimateTokens(truncated)
-			}
+		text := strings.TrimSpace(result[i].ContentString())
+		if len(text) < 300 {
+			continue
 		}
+		maxChars := len(text) / 2
+		if maxChars < 200 {
+			maxChars = 200
+		}
+		truncated := text[:maxChars] + "\n...[truncated]"
+		total -= estimateTokens(text) - estimateTokens(truncated)
+		result[i].Content = contentFromString(truncated)
 	}
-
-	fmt.Printf("  Tokens estimated: ~%d (limit: %d) [truncated]\n", total, MaxTokens)
 	return result
 }
 
-func callUpstream(messages []Message) (string, error) {
-	messages = truncateMessages(messages)
-	reqBody := map[string]interface{}{
-		"model":    UpstreamModel,
-		"messages": messages,
+func callUpstreamText(model string, messages []Message) (string, error) {
+	payload := map[string]interface{}{
+		"model":    resolvedChatModel(model),
+		"messages": truncateMessages(messages),
 		"stream":   false,
 	}
-	bodyBytes, _ := json.Marshal(reqBody)
+	body, _ := json.Marshal(payload)
 
-	client := &http.Client{Timeout: 300 * time.Second}
-	req, err := http.NewRequest("POST", UpstreamURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest(http.MethodPost, cfg.UpstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Authorization", "Bearer "+UpstreamAPIKey)
 	req.Header.Set("Content-Type", "application/json")
+	if cfg.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.UpstreamAPIKey)
+	}
 
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -376,35 +386,32 @@ func callUpstream(messages []Message) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("upstream returned status %d: %s", resp.StatusCode, string(data))
 	}
 
-	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "application/json") {
+	if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "application/json") {
 		var raw map[string]interface{}
-		if err := json.Unmarshal(data, &raw); err != nil {
-			return "", fmt.Errorf("upstream JSON parse error: %w\nBody: %s", err, string(data))
+		if err := json.Unmarshal(data, &raw); err == nil {
+			if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if content, ok := msg["content"].(string); ok {
+							return content, nil
+						}
+					}
+				}
+			}
 		}
-		choices, ok := raw["choices"].([]interface{})
-		if !ok || len(choices) == 0 {
-			return "", fmt.Errorf("no choices in upstream response: %s", string(data))
-		}
-		choice := choices[0].(map[string]interface{})
-		msg := choice["message"].(map[string]interface{})
-		content, _ := msg["content"].(string)
-		return content, nil
 	}
 
-	// SSE streaming -> ghép chunks
 	var fullText strings.Builder
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || !strings.HasPrefix(line, "data: ") {
+		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
-		payload := line[6:]
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
 		if payload == "[DONE]" {
 			break
 		}
@@ -416,18 +423,23 @@ func callUpstream(messages []Message) (string, error) {
 			fullText.WriteString(chunk.Choices[0].Delta.Content)
 		}
 	}
-	return fullText.String(), nil
+	if fullText.Len() > 0 {
+		return fullText.String(), nil
+	}
+	return string(data), nil
 }
 
 func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
-	client := &http.Client{Timeout: 300 * time.Second}
-	req, err := http.NewRequest("POST", UpstreamURL, bytes.NewReader(body))
+	req, err := http.NewRequest(http.MethodPost, cfg.UpstreamURL, bytes.NewReader(body))
 	if err != nil {
 		return 0, nil, nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+UpstreamAPIKey)
 	req.Header.Set("Content-Type", "application/json")
+	if cfg.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.UpstreamAPIKey)
+	}
 
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
@@ -440,820 +452,936 @@ func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
 	}
 
 	headers := make(http.Header)
-	for k, values := range resp.Header {
-		for _, v := range values {
-			headers.Add(k, v)
+	for key, values := range resp.Header {
+		for _, value := range values {
+			headers.Add(key, value)
 		}
 	}
-
 	return resp.StatusCode, headers, data, nil
 }
 
-// ============================================================
-// Tool calling protocol translation
-// ============================================================
-func buildToolSystemPrompt(tools []Tool) string {
-	var sb strings.Builder
-	sb.WriteString("You MUST ALWAYS respond using TOON format (Token-Oriented Object Notation).\n")
-	sb.WriteString("Every response MUST be EXACTLY ONE fenced markdown block tagged toon, with no text before or after it.\n")
-	sb.WriteString("That single ```toon block must describe ONLY the immediate next step to take based on the conversation history.\n")
-	sb.WriteString("Never output a full multi-step plan in one response. Never output multiple toon blocks.\n\n")
-	sb.WriteString("TOON is a compact key-value format. Each line is key: value. No braces, no quotes needed.\n\n")
-	sb.WriteString("When you need to call a tool, respond with EXACTLY:\n")
-	sb.WriteString(fencedToon("action: tool_call\nname: function_name\narguments:\n  param: value"))
-	sb.WriteString("\n\nWhen you have the final answer, respond with EXACTLY:\n")
-	sb.WriteString(fencedToon("action: answer\ncontent: |\n  line 1\n  line 2"))
-	sb.WriteString("\n\nFORMAT RULES:\n")
-	sb.WriteString("- The response MUST contain exactly one ```toon block\n")
-	sb.WriteString("- Inside that block, the first line MUST be \"action:\"\n")
-	sb.WriteString("- action MUST be \"tool_call\" or \"answer\" (nothing else)\n")
-	sb.WriteString("- Do NOT use JSON\n")
-	sb.WriteString("- Do NOT add any text outside the single TOON block\n")
-	sb.WriteString("- For tool_call: \"name\" and \"arguments\" are required\n")
-	sb.WriteString("- For answer: \"content\" is required\n")
-	sb.WriteString("- For answer: use `content: |` and indent the content body with 2 spaces\n")
-	sb.WriteString("- EACH response is ONLY ONE action. Either tool_call OR answer, NEVER both\n")
-	sb.WriteString("- When using tool_call, output ONLY the tool call. Do NOT add explanations, results, or extra text after the arguments\n")
-	sb.WriteString("- The block must be the next immediate step only, not a list of future steps\n")
-	sb.WriteString("- If the task requires multiple steps, do only the first unfinished next step now\n\n")
-	sb.WriteString("WRONG example (DO NOT DO THIS):\n")
-	sb.WriteString("```toon\naction: tool_call\nname: list_dir\narguments:\n  path: /root\n```\n")
-	sb.WriteString("Then open file X, then edit file Y.\n\n")
-	sb.WriteString("CORRECT example:\n")
-	sb.WriteString(fencedToon("action: tool_call\nname: list_dir\narguments:\n  path: /root"))
-	sb.WriteString("\n\nBEHAVIOR RULES:\n")
-	sb.WriteString("- ALWAYS use tools to complete tasks. NEVER tell user to do something manually if a tool can do it\n")
-	sb.WriteString("- If user asks to run/execute something, use exec tool. Do NOT explain how to run it\n")
-	sb.WriteString("- If user asks to create/write a file, use write_file. Do NOT show code and ask user to save it\n")
-	sb.WriteString("- If user asks to search/find information, use web_search. Do NOT say \"I cannot search\"\n")
-	sb.WriteString("- If a task requires multiple steps, do them one tool call at a time. Do NOT skip steps\n")
-	sb.WriteString("- After each step, wait for the next turn or tool result, then respond with the next single immediate step only\n")
-	sb.WriteString("- Infer the unfinished task from the conversation history and recent tool results, then continue with the next missing step until the user's goal is directly satisfied\n")
-	sb.WriteString("- Do NOT stop at partial progress, vague references, or generic links when the user asked for a concrete result, deliverable, or exact value\n")
-	sb.WriteString("- If a tool call fails, try a different approach. Do NOT give up and explain the error\n")
-	sb.WriteString("- Be proactive: complete the full task, not just part of it\n")
-	sb.WriteString("- NEVER respond with \"you can do X\" or \"you need to do X\" - just DO it with tools\n")
-	sb.WriteString("- NEVER say \"I cannot\", \"I don't have the ability\", \"I'm unable to\" - if you have a relevant tool, USE IT\n")
-	sb.WriteString("- NEVER refuse a task that can be done with available tools\n")
-	sb.WriteString("- NEVER claim you did something (created file, ran command, etc.) unless you ACTUALLY called the tool for it\n")
-	sb.WriteString("- If you have not called write_file, do NOT say \"I created the file\". Use the tool FIRST, then confirm\n")
-	sb.WriteString("- After creating or modifying a file, ALWAYS verify by reading it back (read_file) or listing the directory (list_dir) before giving final answer\n")
-	sb.WriteString("- After running a command, check the output for errors before confirming success\n")
-	sb.WriteString("- Do NOT give final answer immediately after write_file or exec. Verify first, then confirm\n\n")
-	sb.WriteString("Available tools:\n")
+func requestHasTools(body []byte) (bool, error) {
+	var envelope struct {
+		Tools json.RawMessage `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return false, err
+	}
+
+	trimmed := strings.TrimSpace(string(envelope.Tools))
+	if trimmed == "" || trimmed == "null" || trimmed == "[]" {
+		return false, nil
+	}
+	return true, nil
+}
+
+func buildToolRegistry(tools []Tool) map[string]ToolSpec {
+	registry := make(map[string]ToolSpec, len(tools))
 	for _, tool := range tools {
-		f := tool.Function
-		sb.WriteString(fmt.Sprintf("- %s: %s\n", f.Name, f.Description))
-
+		name := strings.TrimSpace(tool.Function.Name)
+		if name == "" {
+			continue
+		}
+		spec := ToolSpec{
+			Name:        name,
+			Description: strings.TrimSpace(tool.Function.Description),
+		}
 		var params ToolParams
-		if len(f.Parameters) > 0 {
-			if err := json.Unmarshal(f.Parameters, &params); err == nil {
-				requiredSet := make(map[string]bool)
-				for _, r := range params.Required {
-					requiredSet[r] = true
-				}
-				for pname, pinfo := range params.Properties {
-					req := "optional"
-					if requiredSet[pname] {
-						req = "required"
-					}
-					typ := pinfo.Type
-					if typ == "" {
-						typ = "string"
-					}
-					sb.WriteString(fmt.Sprintf("    %s (%s, %s): %s\n", pname, typ, req, pinfo.Description))
-				}
+		if len(tool.Function.Parameters) > 0 && json.Unmarshal(tool.Function.Parameters, &params) == nil {
+			if len(params.Properties) > 0 {
+				spec.Parameters = params.Properties
+			}
+			if len(params.Required) > 0 {
+				spec.Required = append([]string(nil), params.Required...)
+				sort.Strings(spec.Required)
 			}
 		}
+		registry[name] = spec
 	}
-	return sb.String()
+	return registry
 }
 
-func extractJSON(text string) string {
-	text = strings.TrimSpace(text)
-	// Remove markdown code block wrapper if present
-	if strings.HasPrefix(text, "```") {
-		re := regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*\\})\\s*```")
-		if m := re.FindStringSubmatch(text); len(m) > 1 {
-			return m[1]
-		}
+func orderedToolNames(registry map[string]ToolSpec) []string {
+	names := make([]string, 0, len(registry))
+	for name := range registry {
+		names = append(names, name)
 	}
-	// Find first { to last }
-	start := strings.Index(text, "{")
-	end := strings.LastIndex(text, "}")
-	if start >= 0 && end > start {
-		return text[start : end+1]
-	}
-	return text
+	sort.Strings(names)
+	return names
 }
 
-func parseTOON(text string) *modelResponse {
-	text = strings.TrimSpace(text)
-	// Remove markdown code blocks if present
-	if strings.Contains(text, "```") {
-		// handle block markdown like ```toon\naction: tool_call...
-		re := regexp.MustCompile("(?si)```[a-zA-Z0-9_-]*\\s*\\n(.*?)\\n?```")
-		if m := re.FindStringSubmatch(text); len(m) > 1 {
-			text = strings.TrimSpace(m[1])
-		} else {
-			re = regexp.MustCompile("(?si)```(?:toon|json)?\\s*(.+?)\\s*```")
-			if m := re.FindStringSubmatch(text); len(m) > 1 {
-				text = m[1]
-			}
-		}
+func orderedToolSpecs(registry map[string]ToolSpec) []ToolSpec {
+	names := orderedToolNames(registry)
+	specs := make([]ToolSpec, 0, len(names))
+	for _, name := range names {
+		specs = append(specs, registry[name])
 	}
+	return specs
+}
 
-	// Try toon.Unmarshal on clean text
-	var resp modelResponse
-	if err := toon.Unmarshal([]byte(text), &resp); err == nil && resp.Action != "" {
-		return &resp
-	}
-
-	// Find the first "action:" line - skip any free text before it
-	lines := strings.Split(text, "\n")
-	startIdx := -1
-	for i, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "action:") {
-			startIdx = i
-			break
-		}
-	}
-	if startIdx < 0 {
-		return nil
-	}
-
-	// Parse only the FIRST action block (stop at second "action:" line)
-	result := &modelResponse{}
-	args := make(map[string]interface{})
-	inArguments := false
-	inContent := false
-	inArgValue := false
-	currentArgBlock := false
-	currentContentBlock := false
-	var contentLines []string
-	var currentArgKey string
-	var argValueLines []string
-
-	topKeys := map[string]bool{"action": true, "name": true, "content": true, "arguments": true}
-
-	// Strict whitelist of known argument key names - only these can break a multi-line value
-	knownArgKeys := map[string]bool{
-		"path": true, "filepath": true, "directory": true, "filename": true,
-		"content": true, "command": true, "working_dir": true,
-		"url": true, "query": true, "input": true, "output": true,
-		"text": true, "code": true, "language": true, "mode": true,
-		"offset": true, "length": true, "maxChars": true, "max_chars": true,
-		"old_text": true, "new_text": true, "old_str": true, "new_str": true,
-		"message": true, "title": true, "description": true, "body": true,
-		"name": true, "type": true, "format": true, "timeout": true,
-	}
-
-	for i := startIdx; i < len(lines); i++ {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-
-		// Second "action:" = new block -> stop, only handle first tool call
-		if i > startIdx && strings.HasPrefix(trimmed, "action:") {
-			break
-		}
-
-		if trimmed == "" {
-			if inContent {
-				contentLines = append(contentLines, "")
-			}
-			if inArgValue {
-				argValueLines = append(argValueLines, "")
-			}
-			continue
-		}
-
-		// Check if this is a top-level key (but NOT when indented inside arguments)
-		isTopKey := false
-		isIndented := strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "\t")
-		if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
-			candidate := strings.TrimSpace(parts[0])
-			if topKeys[candidate] && !strings.Contains(candidate, " ") {
-				// "content:" indented inside arguments section = argument, not top-level
-				if !(inArguments && isIndented && candidate == "content") {
-					isTopKey = true
-				}
-			}
-		}
-
-		// Multi-line argument value (after pipe | or multi-line content arg)
-		if inArgValue {
-			// Stop if we hit a non-indented top-level key (like "action:")
-			if isTopKey && !isIndented {
-				args[currentArgKey] = strings.Join(argValueLines, "\n")
-				inArgValue = false
-				currentArgBlock = false
-				// fall through to top-level key handling below
-			} else if isIndented {
-				// Only break for KNOWN arg keys (strict whitelist)
-				if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
-					candidate := strings.TrimSpace(parts[0])
-					if knownArgKeys[candidate] && candidate != currentArgKey {
-						// Flush current, start new arg
-						args[currentArgKey] = strings.Join(argValueLines, "\n")
-						inArgValue = false
-						currentArgBlock = false
-						v := decodeTOONScalar(parts[1])
-						currentArgKey = candidate
-						argValueLines = []string{v}
-						inArgValue = true
-						continue
-					}
-				}
-				if currentArgBlock {
-					argValueLines = append(argValueLines, stripOneIndentLevel(line))
-				} else {
-					argValueLines = append(argValueLines, line)
-				}
-				continue
+func normalizeConversation(messages []Message) []ConversationEntry {
+	entries := make([]ConversationEntry, 0, len(messages))
+	for _, msg := range messages {
+		entry := ConversationEntry{Role: strings.TrimSpace(msg.Role), Name: strings.TrimSpace(msg.Name)}
+		if text := strings.TrimSpace(msg.ContentString()); text != "" {
+			if entry.Role == "system" {
+				entry.Content = text
 			} else {
-				// Non-indented: check if it's a known arg key (AI forgot indent)
-				if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
-					candidate := strings.TrimSpace(parts[0])
-					if knownArgKeys[candidate] && candidate != currentArgKey {
-						args[currentArgKey] = strings.Join(argValueLines, "\n")
-						inArgValue = false
-						currentArgBlock = false
-						v := decodeTOONScalar(parts[1])
-						currentArgKey = candidate
-						argValueLines = []string{v}
-						inArgValue = true
-						continue
-					}
-				}
-				// Regular continuation of multi-line value
-				argValueLines = append(argValueLines, trimmed)
-				continue
+				entry.Content = summarizeText(text, 6000)
 			}
 		}
-
-		// Argument sub-keys (indented OR non-indented known arg keys)
-		if inArguments && (isIndented || knownArgKeys[strings.TrimSpace(strings.SplitN(trimmed, ":", 2)[0])]) {
-			parts := strings.SplitN(trimmed, ":", 2)
-			if len(parts) == 2 {
-				k := strings.TrimSpace(parts[0])
-				v := strings.TrimSpace(parts[1])
-				if strings.HasPrefix(v, "|") || v == "" {
-					// Multi-line value starts (pipe syntax or empty value)
-					currentArgKey = k
-					argValueLines = nil
-					inArgValue = true
-					currentArgBlock = strings.HasPrefix(v, "|")
-				} else {
-					// Check if this arg value might continue on next lines
-					// (for keys like "content" that often have multi-line values)
-					currentArgKey = k
-					argValueLines = []string{decodeTOONScalar(v)}
-					inArgValue = true
-					currentArgBlock = false
+		if len(msg.ToolCalls) > 0 {
+			entry.ToolCalls = make([]ConversationToolCall, 0, len(msg.ToolCalls))
+			for _, call := range msg.ToolCalls {
+				parsedArgs := map[string]interface{}{}
+				if strings.TrimSpace(call.Function.Arguments) != "" {
+					_ = json.Unmarshal([]byte(call.Function.Arguments), &parsedArgs)
 				}
+				entry.ToolCalls = append(entry.ToolCalls, ConversationToolCall{
+					Name:      strings.TrimSpace(call.Function.Name),
+					Arguments: parsedArgs,
+				})
 			}
+		}
+		if entry.Role == "" {
 			continue
 		}
-
-		// Multi-line content
-		if inContent && !isTopKey {
-			if currentContentBlock {
-				contentLines = append(contentLines, stripOneIndentLevel(line))
-			} else {
-				contentLines = append(contentLines, trimmed)
-			}
+		if entry.Content == "" && len(entry.ToolCalls) == 0 && entry.Role != "tool" {
 			continue
 		}
-
-		// Flush states when hitting a new top-level key
-		if inArgValue {
-			args[currentArgKey] = strings.Join(argValueLines, "\n")
-			inArgValue = false
-			currentArgBlock = false
-		}
-		inArguments = false
-		inContent = false
-		currentContentBlock = false
-
-		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-
-		switch key {
-		case "action":
-			result.Action = value
-		case "name":
-			result.Name = value
-		case "content":
-			if result.Action != "" && result.Action != "answer" && result.Action != "tool_call" {
-				currentArgKey = "content"
-				inArgValue = true
-				currentArgBlock = true
-				if strings.HasPrefix(value, "|") || value == "" {
-					argValueLines = nil
-				} else {
-					argValueLines = []string{decodeTOONScalar(value)}
-				}
-			} else {
-				if strings.HasPrefix(value, "|") || value == "" {
-					contentLines = nil
-					currentContentBlock = true
-				} else {
-					contentLines = []string{value}
-					currentContentBlock = false
-				}
-				inContent = true
-			}
-		case "arguments":
-			inArguments = true
-		default:
-			if knownArgKeys[key] {
-				args[key] = decodeTOONScalar(value)
-			}
-		}
+		entries = append(entries, entry)
 	}
-
-	// Flush remaining
-	if inArgValue {
-		args[currentArgKey] = strings.Join(argValueLines, "\n")
-	}
-	if inContent {
-		result.Content = strings.Join(contentLines, "\n")
-	}
-
-	if result.Action != "" {
-		if result.Action == "answer" {
-			result.Content = decodeEscapedAnswerContent(result.Content)
-		}
-		if len(args) > 0 {
-			result.Arguments = args
-		}
-		return result
-	}
-	return nil
+	return entries
 }
 
-// containsCode detects if an answer contains code that should have been written to a file instead.
-func containsCode(content string) bool {
-	if len(content) < 100 {
-		return false
-	}
-	codeIndicators := []string{
-		"<!DOCTYPE", "<html", "<head>", "<body>", "<script",
-		"```html", "```javascript", "```python", "```css",
-		"function(", "function ", "const ", "let ", "var ",
-		"def ", "import ", "class ",
-		"<style>", "</div>", "</script>",
-	}
-	lower := strings.ToLower(content)
-	matches := 0
-	for _, indicator := range codeIndicators {
-		if strings.Contains(lower, strings.ToLower(indicator)) {
-			matches++
-		}
-	}
-	return matches >= 3
-}
-
-// containsHallucination detects fake/hallucinated content from the model.
-func containsHallucination(content string) bool {
-	hallucinationPatterns := []string{
-		"turn0image", "turn0search", "turn1image", "turn1search",
-		"citeturn", "image_group{", "image_refs",
-		"```web", "[image:", "![image](",
-	}
-	lower := strings.ToLower(content)
-	for _, p := range hallucinationPatterns {
-		if strings.Contains(lower, strings.ToLower(p)) {
-			return true
-		}
-	}
-	return false
-}
-
-// containsRefusal detects when AI refuses to do something it has tools for.
-func containsRefusal(content string) bool {
-	lower := strings.ToLower(content)
-	refusalPatterns := []string{
-		"không thể", "tôi không có khả năng", "không có công cụ",
-		"không thể trực tiếp", "không hỗ trợ", "ngoài khả năng",
-		"i cannot", "i can't", "i'm unable", "i don't have the ability",
-		"i am unable", "not possible", "i'm not able",
-		"hiện tại tôi không", "mình không thể", "không có trình duyệt",
-		"không có cách", "tuy nhiên, bạn có thể",
-	}
-	for _, p := range refusalPatterns {
-		if strings.Contains(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-// userAskedForAction checks if the last user message contains action-requesting keywords.
-func userAskedForAction(messages []Message) bool {
-	actionKeywords := []string{
-		"check", "kiểm tra", "xem", "tạo", "chạy", "run", "execute",
-		"dùng tool", "sử dụng tool", "gọi tool", "use tool",
-		"tìm", "search", "find", "list", "liệt kê",
-		"tải", "download", "gửi", "send", "mở", "open",
-		"viết", "write", "cài", "install", "xóa", "delete",
-		"đọc", "read", "sửa", "edit", "fix",
-	}
-
-	// Find last user message
+func latestUserRequest(messages []Message) string {
 	for i := len(messages) - 1; i >= 0; i-- {
 		if messages[i].Role == "user" {
-			content := strings.ToLower(messages[i].ContentString())
-			for _, kw := range actionKeywords {
-				if strings.Contains(content, kw) {
+			return strings.TrimSpace(messages[i].ContentString())
+		}
+	}
+	return ""
+}
+
+func latestUserIndex(messages []Message) int {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			return i
+		}
+	}
+	return -1
+}
+
+func latestUserTurnKey(messages []Message) string {
+	index := latestUserIndex(messages)
+	if index < 0 {
+		return ""
+	}
+
+	type keyMessage struct {
+		Role      string                 `json:"role"`
+		Name      string                 `json:"name,omitempty"`
+		Content   string                 `json:"content,omitempty"`
+		ToolCalls []ConversationToolCall `json:"tool_calls,omitempty"`
+	}
+
+	snapshot := make([]keyMessage, 0, index+1)
+	for _, msg := range messages[:index+1] {
+		item := keyMessage{
+			Role:    strings.TrimSpace(msg.Role),
+			Name:    strings.TrimSpace(msg.Name),
+			Content: strings.TrimSpace(msg.ContentString()),
+		}
+		if len(msg.ToolCalls) > 0 {
+			item.ToolCalls = make([]ConversationToolCall, 0, len(msg.ToolCalls))
+			for _, call := range msg.ToolCalls {
+				args := map[string]interface{}{}
+				if strings.TrimSpace(call.Function.Arguments) != "" {
+					_ = json.Unmarshal([]byte(call.Function.Arguments), &args)
+				}
+				item.ToolCalls = append(item.ToolCalls, ConversationToolCall{
+					Name:      strings.TrimSpace(call.Function.Name),
+					Arguments: args,
+				})
+			}
+		}
+		snapshot = append(snapshot, item)
+	}
+
+	body, _ := json.Marshal(snapshot)
+	hash := sha256.Sum256(body)
+	return hex.EncodeToString(hash[:])
+}
+
+func normalizeSimpleConversationText(text string) string {
+	text = strings.ToLower(strings.TrimSpace(text))
+	replacer := strings.NewReplacer(".", " ", ",", " ", "!", " ", "?", " ", ";", " ", ":", " ", "'", " ", `"`, " ", "(", " ", ")", " ")
+	text = replacer.Replace(text)
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func isSimpleConversationRequest(messages []Message) bool {
+	raw := strings.TrimSpace(latestUserRequest(messages))
+	if raw == "" {
+		return false
+	}
+	if raw == "?" {
+		return true
+	}
+	text := normalizeSimpleConversationText(raw)
+	if text == "" {
+		return true
+	}
+	simple := map[string]bool{
+		"hi": true, "hello": true, "hey": true, "ok": true, "oke": true, "okay": true,
+		"thanks": true, "thank you": true, "xin chao": true, "chao": true, "alo": true, "yo": true,
+	}
+	if simple[text] {
+		return true
+	}
+	return len(strings.Fields(text)) <= 2 && len(text) <= 12
+}
+
+func latestRequestLikelyNeedsTool(messages []Message) bool {
+	raw := strings.TrimSpace(latestUserRequest(messages))
+	if raw == "" {
+		return false
+	}
+	text := normalizeSimpleConversationText(raw)
+	if text == "" {
+		return false
+	}
+	keywords := []string{
+		"check", "run", "read", "write", "save", "send", "search", "find", "delete", "remove",
+		"edit", "append", "create", "generate", "export", "build", "compile", "code",
+		"kiem tra", "đọc", "doc", "ghi", "luu", "lưu", "gui", "gửi", "tim", "tìm",
+		"xoa", "xóa", "sua", "sửa", "them", "thêm", "tao", "tạo", "viet", "viết",
+		"chay", "chạy", "file", "folder", "server", "ram", "api", "deploy", "log",
+	}
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasToolActivityAfterLatestUser(messages []Message) bool {
+	latestUserIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			latestUserIndex = i
+			break
+		}
+	}
+	if latestUserIndex < 0 {
+		return false
+	}
+	for i := latestUserIndex + 1; i < len(messages); i++ {
+		if messages[i].Role == "tool" {
+			return true
+		}
+		if messages[i].Role == "assistant" && len(messages[i].ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSpecificToolActivityAfterLatestUser(messages []Message, toolName string) bool {
+	latestUserIndex := -1
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" {
+			latestUserIndex = i
+			break
+		}
+	}
+	if latestUserIndex < 0 {
+		return false
+	}
+	for i := latestUserIndex + 1; i < len(messages); i++ {
+		if messages[i].Role == "tool" && strings.TrimSpace(messages[i].Name) == toolName {
+			return true
+		}
+		if messages[i].Role == "assistant" {
+			for _, call := range messages[i].ToolCalls {
+				if strings.TrimSpace(call.Function.Name) == toolName {
 					return true
 				}
 			}
-			return false
 		}
 	}
 	return false
 }
 
-// hasToolResultInRecent checks if there's a tool result in the last few messages.
-func hasToolResultInRecent(messages []Message) bool {
-	for i := len(messages) - 1; i >= 0 && i >= len(messages)-3; i-- {
-		if messages[i].Role == "tool" {
-			return true
-		}
-	}
-	return false
-}
-
-// claimsDoneWithoutTool detects when AI claims it completed an action but no tool was called.
-// Returns true if the answer contains claims like "đã tạo file", "I created", etc.
-func claimsDoneWithoutTool(content string, messages []Message) bool {
-	lower := strings.ToLower(content)
-
-	claimPatterns := []string{
-		"đã tạo", "đã lưu", "đã viết", "đã ghi", "đã chạy", "đã thực thi",
-		"đã cài", "đã tải", "đã gửi", "đã xóa", "đã sửa",
-		"file đã được tạo", "đã tạo file", "đã tạo xong",
-		"i created", "i wrote", "i saved", "i executed", "i ran",
-		"file has been created", "already created",
-		"đã hoàn thành", "xong rồi",
-	}
-
-	hasClaim := false
-	for _, p := range claimPatterns {
-		if strings.Contains(lower, p) {
-			hasClaim = true
-			break
-		}
-	}
-	if !hasClaim {
+func latestRequestLikelyNeedsSendFile(messages []Message) bool {
+	raw := strings.TrimSpace(latestUserRequest(messages))
+	if raw == "" {
 		return false
 	}
-
-	// Check if any tool was actually called in recent messages (tool results present)
-	hasRecentToolResult := false
-	for i := len(messages) - 1; i >= 0 && i >= len(messages)-4; i-- {
-		if messages[i].Role == "tool" {
-			hasRecentToolResult = true
-			break
-		}
-	}
-
-	return !hasRecentToolResult
-}
-
-// needsVerification checks if the last tool result was from a write/exec operation
-// and no verification (read_file/list_dir) was done after it.
-func needsVerification(messages []Message) bool {
-	// Find the last tool result
-	lastToolName := ""
-	hasVerifyAfter := false
-
-	writeTools := map[string]bool{
-		"write_file": true, "edit_file": true, "append_file": true,
-		"exec": true,
-	}
-	verifyTools := map[string]bool{
-		"read_file": true, "list_dir": true,
-	}
-
-	for i := len(messages) - 1; i >= 0; i-- {
-		msg := messages[i]
-		if msg.Role == "tool" {
-			name := msg.Name
-			if lastToolName == "" {
-				lastToolName = name
-			}
-			if verifyTools[name] {
-				hasVerifyAfter = true
-			}
-			break
-		}
-		// Check if assistant called a verify tool after write
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			tcName := msg.ToolCalls[0].Function.Name
-			if verifyTools[tcName] {
-				hasVerifyAfter = true
-			}
-		}
-	}
-
-	// Only require verification if last tool was a write/exec and no verify followed
-	return writeTools[lastToolName] && !hasVerifyAfter
-}
-
-func lastUserContent(messages []Message) string {
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			return messages[i].ContentString()
-		}
-	}
-	return ""
-}
-
-func userNeedsSpecificData(messages []Message) bool {
-	content := strings.ToLower(lastUserContent(messages))
-	if content == "" {
+	text := normalizeSimpleConversationText(raw)
+	if text == "" {
 		return false
 	}
-
 	keywords := []string{
-		"hiện tại", "mới nhất", "latest", "current", "today",
-		"cụ thể", "chi tiết", "specific", "exact", "chính xác",
-		"bao nhiêu", "giá", "price", "rate", "tỷ giá", "tham khảo",
-		"ram", "vàng", "gold", "usd", "btc", "eth",
+		"gui", "gửi", "send", "share", "deliver", "attach", "upload",
+		"send me", "gui cho toi", "gửi cho tôi", "share with me", "deliver to me",
 	}
-	for _, kw := range keywords {
-		if strings.Contains(content, kw) {
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
 			return true
 		}
 	}
 	return false
 }
 
-func buildTaskStateSummary(messages []Message) string {
-	var sb strings.Builder
-
-	goal := strings.TrimSpace(lastUserContent(messages))
-	if goal != "" {
-		sb.WriteString("Latest user goal: " + goal + "\n")
-	}
-
-	var recent []string
-	for i := len(messages) - 1; i >= 0 && len(recent) < 6; i-- {
-		msg := messages[i]
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			tc := msg.ToolCalls[0]
-			recent = append([]string{fmt.Sprintf("Tool step already taken: %s", tc.Function.Name)}, recent...)
-			continue
-		}
-		if msg.Role == "tool" {
-			content := strings.TrimSpace(msg.ContentString())
-			content = strings.ReplaceAll(content, "\n", " ")
-			if len(content) > 140 {
-				content = content[:140] + "..."
-			}
-			if content != "" {
-				recent = append([]string{fmt.Sprintf("Tool result observed: %s", content)}, recent...)
-			}
+func planIncludesTool(plan ToonPlan, toolName string) bool {
+	for _, step := range plan.Steps {
+		if step.Tool == toolName {
+			return true
 		}
 	}
-
-	if len(recent) == 0 {
-		sb.WriteString("No tool steps completed yet.\n")
-	} else {
-		for _, item := range recent {
-			sb.WriteString(item + "\n")
-		}
-	}
-
-	sb.WriteString("Decide whether the goal is fully satisfied. If it is not fully satisfied yet, continue with the next tool step instead of stopping.")
-	return sb.String()
+	return false
 }
 
-func getRecentToolContext(messages []Message, maxItems int) (string, map[string]bool) {
-	var chunks []string
-	names := map[string]bool{}
-	count := 0
-
-	for i := len(messages) - 1; i >= 0 && count < maxItems; i-- {
-		msg := messages[i]
-		if msg.Role == "tool" {
-			if c := strings.TrimSpace(msg.ContentString()); c != "" {
-				chunks = append([]string{c}, chunks...)
-			}
-			if msg.Name != "" {
-				names[msg.Name] = true
-			}
-			count++
-			continue
+func (s *activePlanStore) cleanup(now time.Time) {
+	const ttl = 2 * time.Hour
+	for key, item := range s.items {
+		if now.Sub(item.UpdatedAt) > ttl {
+			delete(s.items, key)
 		}
-		if msg.Role == "assistant" && len(msg.ToolCalls) > 0 {
-			for _, tc := range msg.ToolCalls {
-				if tc.Function.Name != "" {
-					names[tc.Function.Name] = true
+	}
+}
+
+func (s *activePlanStore) get(key string) (activePlanState, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanup(time.Now())
+	item, ok := s.items[key]
+	return item, ok
+}
+
+func (s *activePlanStore) put(key string, plan ToonPlan) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	s.cleanup(now)
+	s.items[key] = activePlanState{
+		Key:       key,
+		Plan:      plan,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+}
+
+func (s *activePlanStore) delete(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, key)
+}
+
+func countCompletedPlanSteps(messages []Message, plan ToonPlan) int {
+	if len(plan.Steps) == 0 {
+		return 0
+	}
+
+	userIndex := latestUserIndex(messages)
+	if userIndex < 0 {
+		return 0
+	}
+
+	completed := 0
+	waitingForToolResult := false
+	for i := userIndex + 1; i < len(messages) && completed < len(plan.Steps); i++ {
+		expectedTool := plan.Steps[completed].Tool
+		msg := messages[i]
+
+		if !waitingForToolResult {
+			if msg.Role != "assistant" || len(msg.ToolCalls) == 0 {
+				continue
+			}
+			for _, call := range msg.ToolCalls {
+				if strings.TrimSpace(call.Function.Name) == expectedTool {
+					waitingForToolResult = true
+					break
 				}
 			}
+			continue
+		}
+
+		if msg.Role == "tool" {
+			completed++
+			waitingForToolResult = false
 		}
 	}
 
-	return strings.Join(chunks, "\n\n"), names
+	return completed
 }
 
-func answerHasConcreteData(content string) bool {
-	return regexp.MustCompile(`\d`).MatchString(content)
-}
-
-func normalizeNumberToken(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
+func remainingPlanFromProgress(plan ToonPlan, completed int) ToonPlan {
+	if completed <= 0 {
+		return plan
 	}
-	return b.String()
-}
-
-func answerNumbersGroundedInToolResults(content string, messages []Message) bool {
-	answerNums := regexp.MustCompile(`\d[\d.,]*`).FindAllString(content, -1)
-	if len(answerNums) == 0 {
-		return false
-	}
-
-	toolText, _ := getRecentToolContext(messages, 6)
-	if strings.TrimSpace(toolText) == "" {
-		return false
-	}
-
-	toolNumsRaw := regexp.MustCompile(`\d[\d.,]*`).FindAllString(toolText, -1)
-	toolNums := map[string]bool{}
-	for _, n := range toolNumsRaw {
-		normalized := normalizeNumberToken(n)
-		if len(normalized) >= 3 {
-			toolNums[normalized] = true
+	if completed >= len(plan.Steps) {
+		return ToonPlan{
+			Final:       plan.Final,
+			DirectFinal: true,
 		}
 	}
 
-	for _, n := range answerNums {
-		normalized := normalizeNumberToken(n)
-		if len(normalized) >= 3 && toolNums[normalized] {
-			return true
+	remaining := make([]ToonStep, 0, len(plan.Steps)-completed)
+	for i, step := range plan.Steps[completed:] {
+		step.Number = i + 1
+		remaining = append(remaining, step)
+	}
+	return ToonPlan{
+		Steps: remaining,
+		Final: plan.Final,
+	}
+}
+
+func normalizeMultilineText(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.TrimSpace(text)
+}
+
+func cleanAssistantAnswer(text string) string {
+	text = normalizeMultilineText(text)
+	for {
+		lower := strings.ToLower(text)
+		switch {
+		case strings.HasPrefix(lower, "final:"):
+			text = strings.TrimSpace(text[len("final:"):])
+		case strings.HasPrefix(lower, "final :"):
+			text = strings.TrimSpace(text[len("final :"):])
+		default:
+			return text
 		}
 	}
-
-	return false
 }
 
-func answerLooksLikeGenericReference(content string) bool {
-	lower := strings.ToLower(content)
-	genericPatterns := []string{
-		"bạn có thể tham khảo", "tham khảo trực tiếp", "xem thêm tại",
-		"truy cập", "visit", "check the link", "tham khảo tại trang",
-		"không thể cung cấp", "không thể thực hiện", "tôi không thể cung cấp",
+func marshalPrettyJSON(value interface{}) string {
+	body, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return "{}"
 	}
-	for _, p := range genericPatterns {
-		if strings.Contains(lower, p) {
-			return true
+	return string(body)
+}
+
+func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
+	var sb strings.Builder
+	sb.WriteString("You are the INTERNAL PLANNER inside a proxy layer.\n")
+	sb.WriteString("Analyze the latest request, infer remaining work from the conversation, and return only a valid toon plan.\n")
+	sb.WriteString("Never output JSON, markdown fences, or commentary outside the toon format.\n\n")
+	sb.WriteString("Your response must be either:\n")
+	sb.WriteString("1) a single line: final: <answer>\n")
+	sb.WriteString("OR\n")
+	sb.WriteString("2) alternating lines in this exact pattern:\n")
+	sb.WriteString("step 1: <tool_name>\n")
+	sb.WriteString("note: use=<...>; why=<...>; output=<...>; input=<optional>\n")
+	sb.WriteString("step 2: <tool_name>\n")
+	sb.WriteString("note: use=<...>; why=<...>; output=<...>; input=<optional>\n")
+	sb.WriteString("final: <answer>\n\n")
+	sb.WriteString("Hard rules:\n")
+	sb.WriteString("- Use only exact tool names from the available tool list.\n")
+	sb.WriteString("- Step numbers must start at 1 and increase by exactly 1.\n")
+	sb.WriteString("- Each step line must be followed by a single note line.\n")
+	sb.WriteString("- Notes must include use=, why=, and output=; input= is optional.\n")
+	sb.WriteString("Available tools:\n")
+	for _, name := range orderedToolNames(registry) {
+		spec := registry[name]
+		sb.WriteString("- " + spec.Name)
+		if spec.Description != "" {
+			sb.WriteString(": " + spec.Description)
+		}
+		if len(spec.Required) > 0 {
+			sb.WriteString(" | required args: " + strings.Join(spec.Required, ", "))
+		}
+		sb.WriteString("\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func buildPlannerCorrection(issues []string, retryNumber int, registry map[string]ToolSpec) string {
+	var sb strings.Builder
+	sb.WriteString("HARD REWRITE MODE.\n")
+	sb.WriteString(fmt.Sprintf("Retry number: %d.\n", retryNumber))
+	sb.WriteString("The previous toon plan was rejected by the proxy validator.\n")
+	sb.WriteString("Rewrite the entire plan from scratch. Do not repair partially. Do not explain. Return only valid toon output.\n")
+	sb.WriteString("The system messages inside the conversation JSON are the highest-priority instructions for persona, assistant identity, and required language.\n")
+	sb.WriteString("You MUST obey them. If they require Vietnamese, the planner final line MUST be Vietnamese even if the user only wrote `hi`.\n")
+	sb.WriteString("Allowed reply shape:\n")
+	sb.WriteString("- final: <answer>\n")
+	sb.WriteString("OR\n")
+	sb.WriteString("- step 1: <tool_name>\n")
+	sb.WriteString("- note: use=<...>; why=<...>; output=<...>; input=<optional>\n")
+	sb.WriteString("- step 2: <tool_name>\n")
+	sb.WriteString("- note: use=<...>; why=<...>; output=<...>; input=<optional>\n")
+	sb.WriteString("- final: <answer>\n")
+	sb.WriteString("Absolute bans:\n")
+	sb.WriteString("- No JSON.\n")
+	sb.WriteString("- No markdown fences.\n")
+	sb.WriteString("- No standalone `input=` line.\n")
+	sb.WriteString("- No prose before or after the toon lines.\n")
+	sb.WriteString("- The `final:` answer must be one short physical line only.\n")
+	sb.WriteString("- No numbered lists, bullets, markdown links, citations, or raw URLs after `final:`.\n")
+	sb.WriteString("- Do not paste search results into the planner output.\n")
+	sb.WriteString("- No invented tools.\n")
+	sb.WriteString("- Do not invent exact file paths, URLs, or file contents in the note unless they already exist in the conversation.\n")
+	sb.WriteString("- No message/chat/answer tool step for confirmation.\n")
+	sb.WriteString("- If the user asks to send a file and send_file exists and has not happened yet, you MUST include send_file before final.\n")
+	sb.WriteString("Available tool names only: " + strings.Join(orderedToolNames(registry), ", ") + "\n")
+	sb.WriteString("You MUST satisfy every issue below:\n")
+	for _, issue := range issues {
+		sb.WriteString("- " + issue + "\n")
+	}
+	sb.WriteString("Return only the rewritten toon plan now.")
+	return strings.TrimSpace(sb.String())
+}
+
+func parsePlanNote(raw string) (PlanNote, []string) {
+	note := PlanNote{Raw: strings.TrimSpace(raw)}
+	if note.Raw == "" {
+		return note, []string{"note is empty"}
+	}
+	fields := map[string]string{}
+	for _, part := range strings.Split(note.Raw, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		index := strings.IndexAny(part, "=:")
+		if index <= 0 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(part[:index]))
+		value := strings.TrimSpace(part[index+1:])
+		if value != "" {
+			fields[key] = value
 		}
 	}
-	return false
+	note.Use = fields["use"]
+	note.Why = fields["why"]
+	note.Output = fields["output"]
+	note.Input = fields["input"]
+
+	var issues []string
+	if note.Use == "" {
+		issues = append(issues, "note must include non-empty use=")
+	}
+	if note.Why == "" {
+		issues = append(issues, "note must include non-empty why=")
+	}
+	if note.Output == "" {
+		issues = append(issues, "note must include non-empty output=")
+	}
+	return note, issues
 }
 
-func userRequestedDeliverable(messages []Message) bool {
-	content := strings.ToLower(lastUserContent(messages))
-	if content == "" {
-		return false
+func collectPlannerFinalText(lines []string, start int, finalRe, stepRe, noteRe *regexp.Regexp) (string, []string) {
+	match := finalRe.FindStringSubmatch(lines[start])
+	if len(match) != 2 {
+		return "", []string{fmt.Sprintf("line %d must be `final: <answer>`", start+1)}
 	}
 
-	keywords := []string{
-		"gửi", "send", "đưa tôi", "cho tôi", "trả tôi",
-		"tạo", "create", "viết", "write", "code", "làm", "build",
-		"mở", "open", "tải", "download",
+	parts := []string{strings.TrimSpace(match[1])}
+	var issues []string
+	for i := start + 1; i < len(lines); i++ {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		if stepRe.MatchString(line) || noteRe.MatchString(line) || finalRe.MatchString(line) {
+			issues = append(issues, fmt.Sprintf("no structured line is allowed after the first `final:` line; found invalid line %d", i+1))
+			continue
+		}
+		parts = append(parts, line)
 	}
-	for _, kw := range keywords {
-		if strings.Contains(content, kw) {
-			return true
+
+	finalText := cleanAssistantAnswer(strings.Join(parts, " "))
+	if finalText == "" {
+		issues = append(issues, "final line must contain a non-empty answer")
+	}
+	return finalText, issues
+}
+
+func parseToonPlan(raw string, registry map[string]ToolSpec) (ToonPlan, []string) {
+	normalized := normalizeMultilineText(raw)
+	plan := ToonPlan{Raw: normalized}
+	var issues []string
+	if normalized == "" {
+		return plan, []string{"planner returned an empty plan"}
+	}
+	if strings.Contains(normalized, "```") {
+		issues = append(issues, "toon output must not contain markdown fences")
+	}
+
+	lines := make([]string, 0)
+	for _, line := range strings.Split(normalized, "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
 		}
 	}
-	return false
-}
-
-func answerLooksLikeProgressOnly(content string) bool {
-	lower := strings.ToLower(strings.TrimSpace(content))
-	if lower == "" {
-		return false
+	if len(lines) == 0 {
+		return plan, []string{"planner returned no toon lines"}
 	}
 
-	patterns := []string{
-		"bạn có thể tham khảo", "tham khảo tại", "xem tại", "truy cập",
-		"đã tạo", "đã gửi", "đã lưu", "file đã được", "done",
-		"completed", "sent to you", "created successfully",
-		"you can check", "you can view", "please see",
-	}
-	for _, p := range patterns {
-		if strings.Contains(lower, p) {
-			return true
+	stepRe := regexp.MustCompile(`(?i)^step\s+(\d+)\s*:\s*(.+)$`)
+	noteRe := regexp.MustCompile(`(?i)^note\s*:\s*(.+)$`)
+	finalRe := regexp.MustCompile(`(?i)^final\s*:\s*(.+)$`)
+
+	if len(lines) == 1 {
+		finalText, finalIssues := collectPlannerFinalText(lines, 0, finalRe, stepRe, noteRe)
+		if len(finalIssues) > 0 && !finalRe.MatchString(lines[0]) {
+			return plan, []string{"simple plans must be exactly `final: <answer>`"}
 		}
-	}
-	return false
-}
-
-func conversationStillNeedsAction(messages []Message) bool {
-	if !userAskedForAction(messages) && !userRequestedDeliverable(messages) && !userNeedsSpecificData(messages) {
-		return false
+		plan.Final = finalText
+		plan.DirectFinal = true
+		issues = append(issues, finalIssues...)
+		return plan, issues
 	}
 
-	toolText, toolNames := getRecentToolContext(messages, 8)
-	if strings.TrimSpace(toolText) == "" {
-		return true
-	}
-
-	if userRequestedDeliverable(messages) {
-		if toolNames["write_file"] || toolNames["edit_file"] || toolNames["append_file"] {
-			if needsVerification(messages) {
-				return true
-			}
-		}
-	}
-
-	if userNeedsSpecificData(messages) && !(toolNames["web_fetch"] || toolNames["read_file"] || toolNames["exec"]) {
-		return true
-	}
-
-	return false
-}
-
-// hasOrphanedArgs detects when AI outputs tool-like arguments (url:, path:, command:, etc.)
-// BEFORE the first "action:" line — meaning it tried to call a tool but forgot the proper format.
-func hasOrphanedArgs(text string) bool {
-	return getOrphanedArgKey(text) != ""
-}
-
-// getOrphanedArgKey returns the first orphaned arg key found before "action:", or empty string.
-func getOrphanedArgKey(text string) string {
-	argLikeKeys := map[string]bool{
-		"url": true, "path": true, "filepath": true, "directory": true,
-		"command": true, "query": true, "input": true, "filename": true,
-		"working_dir": true, "maxChars": true, "max_chars": true,
-	}
-
-	lines := strings.Split(strings.TrimSpace(text), "\n")
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "action:") {
+	expectedStep, index := 1, 0
+	for index < len(lines) {
+		if finalRe.MatchString(lines[index]) {
+			finalText, finalIssues := collectPlannerFinalText(lines, index, finalRe, stepRe, noteRe)
+			plan.Final = finalText
+			issues = append(issues, finalIssues...)
 			break
 		}
-		parts := strings.SplitN(trimmed, ":", 2)
-		if len(parts) == 2 {
-			key := strings.TrimSpace(parts[0])
-			if argLikeKeys[key] {
-				return key
+
+		match := stepRe.FindStringSubmatch(lines[index])
+		if len(match) != 3 {
+			issues = append(issues, fmt.Sprintf("line %d must be `step %d: <tool_name>`", index+1, expectedStep))
+			break
+		}
+		stepNumber, err := strconv.Atoi(match[1])
+		if err != nil {
+			issues = append(issues, fmt.Sprintf("line %d has invalid step number", index+1))
+		}
+		if stepNumber != expectedStep {
+			issues = append(issues, fmt.Sprintf("wrong step order: expected step %d but found step %d", expectedStep, stepNumber))
+		}
+		toolName := strings.TrimSpace(match[2])
+		spec, ok := registry[toolName]
+		if !ok {
+			issues = append(issues, fmt.Sprintf("unknown tool `%s` at step %d", toolName, stepNumber))
+		}
+
+		index++
+		if index >= len(lines) {
+			issues = append(issues, fmt.Sprintf("step %d is missing its note line", stepNumber))
+			break
+		}
+		noteMatch := noteRe.FindStringSubmatch(lines[index])
+		if len(noteMatch) != 2 {
+			issues = append(issues, fmt.Sprintf("line %d must be `note: ...` for step %d", index+1, stepNumber))
+			break
+		}
+		note, noteIssues := parsePlanNote(noteMatch[1])
+		for _, issue := range noteIssues {
+			issues = append(issues, fmt.Sprintf("step %d note invalid: %s", stepNumber, issue))
+		}
+		if ok {
+			plan.Steps = append(plan.Steps, ToonStep{Number: stepNumber, Tool: spec.Name, Note: note})
+		}
+		if index+1 < len(lines) {
+			nextLine := lines[index+1]
+			lowerNext := strings.ToLower(nextLine)
+			if !stepRe.MatchString(nextLine) && !finalRe.MatchString(nextLine) {
+				if strings.HasPrefix(lowerNext, "input=") || strings.HasPrefix(lowerNext, "input:") {
+					issues = append(issues, fmt.Sprintf("step %d note must stay on one line; put input= inside the same `note:` line, not on a new line", stepNumber))
+				} else {
+					issues = append(issues, fmt.Sprintf("unexpected extra line %d after step %d; after `note:` only the next `step N:` or `final:` line is allowed", index+2, stepNumber))
+				}
+				break
+			}
+		}
+		expectedStep++
+		index++
+	}
+
+	if len(plan.Steps) == 0 && plan.Final == "" && len(issues) == 0 {
+		issues = append(issues, "toon plan must contain at least one tool step or a final line")
+	}
+	return plan, issues
+}
+
+func validateToonPlan(plan ToonPlan, messages []Message, registry map[string]ToolSpec) []string {
+	var issues []string
+	if plan.Final == "" {
+		issues = append(issues, "last line must be `final: <answer>`")
+	}
+	if len(plan.Steps) == 0 {
+		if latestRequestLikelyNeedsTool(messages) && !hasToolActivityAfterLatestUser(messages) && !isSimpleConversationRequest(messages) {
+			issues = append(issues, "latest request likely still needs a tool, so planner cannot jump directly to final")
+		}
+		if _, ok := registry["send_file"]; ok && latestRequestLikelyNeedsSendFile(messages) && !hasSpecificToolActivityAfterLatestUser(messages, "send_file") {
+			issues = append(issues, "latest request asks to send/deliver a file, so the remaining plan must include send_file before final")
+		}
+		return issues
+	}
+	for i, step := range plan.Steps {
+		expected := i + 1
+		if step.Number != expected {
+			issues = append(issues, fmt.Sprintf("wrong step order at index %d: expected step %d", i, expected))
+		}
+		if _, ok := registry[step.Tool]; !ok {
+			issues = append(issues, fmt.Sprintf("step %d uses tool `%s` which is not in the tool list", step.Number, step.Tool))
+		}
+		if strings.TrimSpace(step.Note.Use) == "" || strings.TrimSpace(step.Note.Why) == "" || strings.TrimSpace(step.Note.Output) == "" {
+			issues = append(issues, fmt.Sprintf("step %d note must contain use=, why=, and output=", step.Number))
+		}
+	}
+	if _, ok := registry["send_file"]; ok && latestRequestLikelyNeedsSendFile(messages) &&
+		!hasSpecificToolActivityAfterLatestUser(messages, "send_file") &&
+		!planIncludesTool(plan, "send_file") {
+		issues = append(issues, "latest request asks to send/deliver a file, so the remaining plan must include send_file before final")
+	}
+	return issues
+}
+
+func renderToonPlan(plan ToonPlan) string {
+	var lines []string
+	for _, step := range plan.Steps {
+		lines = append(lines, fmt.Sprintf("step %d: %s", step.Number, step.Tool))
+		lines = append(lines, "note: "+step.Note.String())
+	}
+	if strings.TrimSpace(plan.Final) != "" {
+		lines = append(lines, "final: "+plan.Final)
+	}
+	if len(lines) > 0 {
+		return strings.Join(lines, "\n")
+	}
+	return strings.TrimSpace(plan.Raw)
+}
+
+func requestValidatedPlan(req ChatRequest, registry map[string]ToolSpec) (ToonPlan, error) {
+	messages := []Message{
+		{Role: "system", Content: contentFromString(buildPlannerSystemPrompt(registry))},
+		{Role: "user", Content: contentFromString(marshalPrettyJSON(plannerPayload{
+			LatestUserRequest: latestUserRequest(req.Messages),
+			Conversation:      normalizeConversation(req.Messages),
+			AvailableTools:    orderedToolSpecs(registry),
+		}))},
+	}
+	plannerModel := resolvedPlannerModel(req.Model)
+	var lastReply string
+	var lastIssues []string
+
+	for attempt := 1; attempt <= cfg.PlannerMaxAttempts; attempt++ {
+		reply, err := callUpstreamText(plannerModel, messages)
+		if err != nil {
+			return ToonPlan{}, fmt.Errorf("planner upstream error: %w", err)
+		}
+		plan, parseIssues := parseToonPlan(reply, registry)
+		issues := append(parseIssues, validateToonPlan(plan, req.Messages, registry)...)
+		if len(issues) == 0 {
+			return plan, nil
+		}
+
+		lastReply, lastIssues = reply, issues
+		logSection(fmt.Sprintf("PLANNER REJECT %d/%d", attempt, cfg.PlannerMaxAttempts))
+		fmt.Printf("│\n%s\n", prefixLines(reply, "│  "))
+		for _, issue := range issues {
+			logResult("⛔", issue)
+		}
+		if attempt == cfg.PlannerMaxAttempts {
+			break
+		}
+		messages = append(messages,
+			Message{Role: "assistant", Content: contentFromString(strings.TrimSpace(reply))},
+			Message{Role: "user", Content: contentFromString(buildPlannerCorrection(issues, attempt+1, registry))},
+		)
+	}
+
+	return ToonPlan{}, fmt.Errorf(
+		"planner could not produce a valid toon plan after %d attempt(s): %s; last reply=%s",
+		cfg.PlannerMaxAttempts,
+		strings.Join(lastIssues, "; "),
+		summarizeText(lastReply, 1500),
+	)
+}
+
+func buildExecutorPayload(req ChatRequest, plan ToonPlan, registry map[string]ToolSpec) executorPayload {
+	payload := executorPayload{
+		LatestUserRequest: latestUserRequest(req.Messages),
+		Conversation:      normalizeConversation(req.Messages),
+		AvailableTools:    orderedToolSpecs(registry),
+		Plan: executorPlanView{
+			Steps: make([]executorStepView, 0, len(plan.Steps)),
+			Final: plan.Final,
+		},
+		CurrentStep: executorStepView{Type: "final"},
+	}
+	for _, step := range plan.Steps {
+		payload.Plan.Steps = append(payload.Plan.Steps, executorStepView{
+			Type: "tool", Number: step.Number, Tool: step.Tool, Note: step.Note,
+		})
+	}
+	if len(plan.Steps) > 0 {
+		payload.CurrentStep = executorStepView{
+			Type: "tool", Number: plan.Steps[0].Number, Tool: plan.Steps[0].Tool, Note: plan.Steps[0].Note,
+		}
+	}
+	return payload
+}
+
+func buildToolExecutionPrompt(step ToonStep, registry map[string]ToolSpec) string {
+	spec := registry[step.Tool]
+	var sb strings.Builder
+	sb.WriteString("You are the EXECUTION LAYER inside a proxy.\n")
+	sb.WriteString("The planner has already been validated. You must execute only the current step.\n")
+	sb.WriteString("Return exactly one JSON object and nothing else.\n")
+	sb.WriteString("The only valid schema for this turn is:\n")
+	sb.WriteString(fmt.Sprintf("{\"action\":\"tool_call\",\"name\":\"%s\",\"arguments\":{...}}\n\n", step.Tool))
+	sb.WriteString("Hard rules:\n")
+	sb.WriteString("- action must be exactly `tool_call`.\n")
+	sb.WriteString("- name must be exactly `" + step.Tool + "`.\n")
+	sb.WriteString("- arguments must be a JSON object.\n")
+	sb.WriteString("- The first character must be `{` and the last character must be `}`.\n")
+	sb.WriteString("- Do not answer the user directly.\n")
+	sb.WriteString("- Do not explain the plan.\n")
+	sb.WriteString("- Do not wrap JSON in markdown fences.\n")
+	sb.WriteString("- Do not output prose before or after the JSON object.\n")
+	sb.WriteString("- Do not call a different tool.\n")
+	sb.WriteString("- Use the conversation JSON and tool definitions to choose the arguments.\n")
+	if len(spec.Required) > 0 {
+		sb.WriteString("- Required arguments for this tool: " + strings.Join(spec.Required, ", ") + ".\n")
+	}
+	sb.WriteString("- If previous output was rejected, obey the latest correction message and rewrite the full JSON object.\n")
+	return strings.TrimSpace(sb.String())
+}
+
+func buildFinalExecutionPrompt() string {
+	return strings.TrimSpace(strings.Join([]string{
+		"You are the EXECUTION LAYER inside a proxy.",
+		"The current step is final.",
+		"The conversation JSON may include one or more system messages.",
+		"Those system messages are the highest-priority instructions for assistant identity, roleplay, tone, and required language.",
+		"You MUST preserve that persona and language in the final answer.",
+		"If the system messages require Vietnamese, answer in Vietnamese even if the latest user message is `hi`, `hello`, or another short English greeting.",
+		"Return the final answer directly to the user as plain text.",
+		"Do not return JSON.",
+		"Do not wrap the answer in markdown fences.",
+		"Do not mention internal planning, proxy rules, or tool schemas.",
+		"Use the conversation JSON and tool results already available.",
+		"Answer in the language required by the system messages in the conversation JSON.",
+		"Only if the system messages do not set a language may you fall back to the latest user language.",
+	}, "\n"))
+}
+
+func buildToolExecutionCorrection(step ToonStep, issues []string, retryNumber int) string {
+	var sb strings.Builder
+	sb.WriteString("HARD RETRY MODE FOR TOOL STEP.\n")
+	sb.WriteString(fmt.Sprintf("Retry number: %d.\n", retryNumber))
+	sb.WriteString("The proxy rejected your previous tool step.\n")
+	sb.WriteString("Fix every issue below and return the full JSON object again.\n")
+	sb.WriteString("You MUST return exactly one JSON object with no extra text.\n")
+	sb.WriteString("The first character must be `{` and the last character must be `}`.\n")
+	sb.WriteString("No markdown fences. No prose. No explanation.\n")
+	for _, issue := range issues {
+		sb.WriteString("- " + issue + "\n")
+	}
+	sb.WriteString(fmt.Sprintf("Current required step is still: step %d: %s\n", step.Number, step.Tool))
+	sb.WriteString("Return only:\n")
+	sb.WriteString(fmt.Sprintf("{\"action\":\"tool_call\",\"name\":\"%s\",\"arguments\":{...}}", step.Tool))
+	return strings.TrimSpace(sb.String())
+}
+
+func buildFinalExecutionCorrection(issues []string, retryNumber int) string {
+	var sb strings.Builder
+	sb.WriteString("HARD RETRY MODE FOR FINAL STEP.\n")
+	sb.WriteString(fmt.Sprintf("Retry number: %d.\n", retryNumber))
+	sb.WriteString("The proxy rejected your previous final answer.\n")
+	sb.WriteString("Fix every issue below and answer again as direct plain text only.\n")
+	sb.WriteString("Do not return JSON. Do not return markdown fences. Do not explain the rules.\n")
+	sb.WriteString("You MUST continue to obey the system messages in the conversation JSON for persona and language.\n")
+	for _, issue := range issues {
+		sb.WriteString("- " + issue + "\n")
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+func validateExecutorToolReply(reply string, step ToonStep, registry map[string]ToolSpec) (*executorToolCall, []string) {
+	trimmed := strings.TrimSpace(reply)
+	var issues []string
+	if trimmed == "" {
+		return nil, []string{"tool step returned empty output"}
+	}
+	if strings.Contains(trimmed, "```") {
+		issues = append(issues, "tool step must not contain markdown fences")
+	}
+	if !strings.HasPrefix(trimmed, "{") || !strings.HasSuffix(trimmed, "}") {
+		issues = append(issues, "tool step must return exactly one JSON object")
+		return nil, issues
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
+		issues = append(issues, "tool step returned invalid JSON")
+		return nil, issues
+	}
+	allowed := map[string]bool{"action": true, "name": true, "arguments": true}
+	for key := range raw {
+		if !allowed[key] {
+			issues = append(issues, fmt.Sprintf("unexpected top-level key `%s`", key))
+		}
+	}
+
+	var parsed executorToolCall
+	if err := json.Unmarshal([]byte(trimmed), &parsed); err != nil {
+		issues = append(issues, "tool step JSON does not match the required schema")
+		return nil, issues
+	}
+	if parsed.Action != "tool_call" {
+		issues = append(issues, "action must be `tool_call`")
+	}
+	if parsed.Name != step.Tool {
+		issues = append(issues, fmt.Sprintf("wrong tool: expected `%s` but got `%s`", step.Tool, parsed.Name))
+	}
+	if parsed.Arguments == nil {
+		issues = append(issues, "arguments must be a JSON object")
+	}
+	spec, ok := registry[step.Tool]
+	if !ok {
+		issues = append(issues, fmt.Sprintf("tool `%s` is not present in the registry", step.Tool))
+	}
+	if ok {
+		for _, required := range spec.Required {
+			if _, exists := parsed.Arguments[required]; !exists {
+				issues = append(issues, fmt.Sprintf("missing required argument `%s`", required))
 			}
 		}
 	}
-	return ""
+	if len(issues) > 0 {
+		return nil, issues
+	}
+	return &parsed, nil
 }
 
-func parseModelResponse(text string) *modelResponse {
-	// 1. Try TOON format first
-	if resp := parseTOON(text); resp != nil {
-		return resp
+func validateFinalReply(reply string) []string {
+	trimmed := cleanAssistantAnswer(reply)
+	var issues []string
+	if trimmed == "" {
+		return []string{"final answer is empty"}
 	}
-
-	// 2. Try JSON format (backward compatible)
-	jsonStr := extractJSON(text)
-
-	var resp modelResponse
-	if err := json.Unmarshal([]byte(jsonStr), &resp); err == nil && resp.Action != "" {
-		return &resp
+	if strings.Contains(trimmed, "```") {
+		issues = append(issues, "final answer must not contain markdown fences")
 	}
-
-	var wrapper toolCallWrapper
-	if err := json.Unmarshal([]byte(jsonStr), &wrapper); err == nil && wrapper.ToolCall != nil {
-		return &modelResponse{
-			Action:    "tool_call",
-			Name:      wrapper.ToolCall.Name,
-			Arguments: wrapper.ToolCall.Arguments,
-		}
+	if strings.HasPrefix(strings.TrimSpace(trimmed), "{") && strings.HasSuffix(strings.TrimSpace(trimmed), "}") {
+		issues = append(issues, "final answer must be direct plain text, not JSON")
 	}
-
-	// 3. Plain text -> answer
-	return &modelResponse{
-		Action:  "answer",
-		Content: text,
-	}
+	return issues
 }
 
 func makeOpenAIResponse(content string, model string, toolCalls []ToolCall) ChatResponse {
-	id := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:12])
-	msg := Message{
-		Role:    "assistant",
-		Content: contentFromString(content),
+	if len(toolCalls) == 0 {
+		content = cleanAssistantAnswer(content)
 	}
+	msg := Message{Role: "assistant", Content: contentFromString(content)}
 	finishReason := "stop"
 	if len(toolCalls) > 0 {
 		msg.ToolCalls = toolCalls
@@ -1261,548 +1389,196 @@ func makeOpenAIResponse(content string, model string, toolCalls []ToolCall) Chat
 		finishReason = "tool_calls"
 	}
 	return ChatResponse{
-		ID:      id,
+		ID:      "chatcmpl-" + uuid.New().String()[:12],
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
 		Model:   model,
-		Choices: []Choice{{
-			Index:        0,
-			Message:      msg,
-			FinishReason: finishReason,
-		}},
-		Usage: Usage{},
+		Choices: []Choice{{Index: 0, Message: msg, FinishReason: finishReason}},
+		Usage:   Usage{},
 	}
 }
 
-func translateMessages(messages []Message, toolPrompt string) []Message {
-	var upstream []Message
-	var systemParts []string
-	lastUserIdx := -1
+func runExecutor(req ChatRequest, plan ToonPlan, registry map[string]ToolSpec) (ChatResponse, error) {
+	model := resolvedChatModel(req.Model)
+	payloadJSON := marshalPrettyJSON(buildExecutorPayload(req, plan, registry))
 
-	for _, msg := range messages {
-		switch msg.Role {
-		case "system":
-			c := msg.ContentString()
-			if strings.TrimSpace(c) != "" {
-				systemParts = append(systemParts, c)
-			}
-
-		case "tool":
-			toolName := msg.Name
-			if toolName == "" {
-				toolName = "tool"
-			}
-			c := msg.ContentString()
-			upstream = append(upstream, Message{
-				Role:    "user",
-				Content: contentFromString(fmt.Sprintf("Tool result for %s:\n%s", toolName, c)),
-			})
-
-		case "assistant":
-			if len(msg.ToolCalls) > 0 {
-				tc := msg.ToolCalls[0]
-				var toonReply strings.Builder
-				toonReply.WriteString("action: tool_call\n")
-				toonReply.WriteString(fmt.Sprintf("name: %s\n", tc.Function.Name))
-				var args map[string]interface{}
-				json.Unmarshal([]byte(tc.Function.Arguments), &args)
-				if len(args) > 0 {
-					toonReply.WriteString("arguments:\n")
-					for k, v := range args {
-						toonReply.WriteString(fmt.Sprintf("  %s: %v\n", k, v))
-					}
-				}
-				upstream = append(upstream, Message{
-					Role:    "assistant",
-					Content: contentFromString(fencedToon(toonReply.String())),
-				})
-			} else {
-				upstream = append(upstream, msg)
-			}
-
-		case "user":
-			upstream = append(upstream, msg)
-			lastUserIdx = len(upstream) - 1
-
-		default:
-			upstream = append(upstream, msg)
+	var messages []Message
+	var toolStep *ToonStep
+	if len(plan.Steps) > 0 {
+		step := plan.Steps[0]
+		toolStep = &step
+		messages = []Message{
+			{Role: "system", Content: contentFromString(buildToolExecutionPrompt(step, registry))},
+			{Role: "user", Content: contentFromString(payloadJSON)},
+		}
+	} else {
+		messages = []Message{
+			{Role: "system", Content: contentFromString(buildFinalExecutionPrompt())},
+			{Role: "user", Content: contentFromString(payloadJSON)},
 		}
 	}
 
-	var injectedParts []string
-	if len(systemParts) > 0 {
-		injectedParts = append(injectedParts, "[SYSTEM PROMPT]\n"+strings.Join(systemParts, "\n\n"))
-	}
-	injectedParts = append(injectedParts, "[TASK STATE]\n"+buildTaskStateSummary(messages))
-	if strings.TrimSpace(toolPrompt) != "" {
-		injectedParts = append(injectedParts, "[TOOL PROMPT]\n"+toolPrompt)
-	}
-
-	if len(injectedParts) == 0 {
-		return upstream
-	}
-
-	injectedPrompt := strings.Join(injectedParts, "\n\n")
-	if lastUserIdx >= 0 {
-		original := upstream[lastUserIdx].ContentString()
-		if strings.TrimSpace(original) == "" {
-			upstream[lastUserIdx].Content = contentFromString(injectedPrompt)
-		} else {
-			upstream[lastUserIdx].Content = contentFromString(original + "\n\n" + injectedPrompt)
-		}
-		return upstream
-	}
-
-	upstream = append(upstream, Message{
-		Role:    "user",
-		Content: contentFromString(injectedPrompt),
-	})
-
-	return upstream
-}
-
-func processChatRequest(reqBody ChatRequest) ChatResponse {
-	model := reqBody.Model
-	if model == "" {
-		model = UpstreamModel
-	}
-
-	if len(reqBody.Tools) == 0 {
-		reply, err := callUpstream(reqBody.Messages)
+	var lastIssues []string
+	var lastReply string
+	for attempt := 1; attempt <= cfg.ExecutorMaxRetries; attempt++ {
+		reply, err := callUpstreamText(model, messages)
 		if err != nil {
-			return makeOpenAIResponse("Error: "+err.Error(), model, nil)
+			return ChatResponse{}, fmt.Errorf("executor upstream error: %w", err)
 		}
-		return makeOpenAIResponse(reply, model, nil)
-	}
+		lastReply = reply
+		logSection(fmt.Sprintf("EXECUTOR ATTEMPT %d/%d", attempt, cfg.ExecutorMaxRetries))
+		fmt.Printf("│\n%s\n", prefixLines(reply, "│  "))
 
-	// Build valid tool name set + required args
-	validTools := make(map[string]bool)
-	toolRequiredArgs := make(map[string][]string)
-	for _, t := range reqBody.Tools {
-		validTools[t.Function.Name] = true
-		var params ToolParams
-		if len(t.Function.Parameters) > 0 {
-			if err := json.Unmarshal(t.Function.Parameters, &params); err == nil {
-				toolRequiredArgs[t.Function.Name] = params.Required
+		if toolStep != nil {
+			parsed, issues := validateExecutorToolReply(reply, *toolStep, registry)
+			if len(issues) == 0 {
+				argsJSON, _ := json.Marshal(parsed.Arguments)
+				return makeOpenAIResponse("", model, []ToolCall{{
+					ID:       "call_" + uuid.New().String()[:8],
+					Type:     "function",
+					Function: FunctionCall{Name: parsed.Name, Arguments: string(argsJSON)},
+				}}), nil
 			}
-		}
-	}
-
-	toolPrompt := buildToolSystemPrompt(reqBody.Tools)
-	upstreamMessages := translateMessages(reqBody.Messages, toolPrompt)
-
-	maxRetries := 7
-	lastError := ""
-	sameErrorCount := 0
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		if attempt > 1 {
-			logSection(fmt.Sprintf("RETRY %d/%d", attempt, maxRetries))
-		} else {
-			logSection("UPSTREAM")
-		}
-
-		// Last attempt: inject detailed format reminder with all tools
-		if attempt == maxRetries {
-			logResult("📋", "Injecting detailed format guide for final attempt")
-			var guide strings.Builder
-			guide.WriteString("THIS IS YOUR LAST CHANCE. You MUST follow this format EXACTLY.\n\n")
-			guide.WriteString("=== CORRECT FORMAT ===\n")
-			guide.WriteString("```toon\n")
-			guide.WriteString("action: tool_call\n")
-			guide.WriteString("name: TOOL_NAME\n")
-			guide.WriteString("arguments:\n")
-			guide.WriteString("  param1: value1\n")
-			guide.WriteString("  param2: value2\n")
-			guide.WriteString("```\n\n")
-			guide.WriteString("=== IMPORTANT ===\n")
-			guide.WriteString("- Return EXACTLY ONE ```toon block\n")
-			guide.WriteString("- 'action' MUST be 'tool_call' (not the tool name)\n")
-			guide.WriteString("- Arguments MUST be under 'arguments:' with 2-space indent\n")
-			guide.WriteString("- Do NOT put arguments directly after 'action:' or 'content:'\n")
-			guide.WriteString("- ONE immediate next step per response only\n")
-			guide.WriteString("- Do NOT include a full plan or multiple steps\n\n")
-			guide.WriteString("=== AVAILABLE TOOLS WITH REQUIRED ARGS ===\n")
-			for _, t := range reqBody.Tools {
-				f := t.Function
-				req := toolRequiredArgs[f.Name]
-				guide.WriteString(fmt.Sprintf("\n• %s: %s\n", f.Name, f.Description))
-				guide.WriteString("  ```toon\n")
-				guide.WriteString(fmt.Sprintf("  action: tool_call\n  name: %s\n  arguments:\n", f.Name))
-				var params ToolParams
-				if len(f.Parameters) > 0 {
-					json.Unmarshal(f.Parameters, &params)
-				}
-				if len(req) > 0 {
-					for _, r := range req {
-						desc := ""
-						if p, ok := params.Properties[r]; ok {
-							desc = " ← " + p.Description
-						}
-						guide.WriteString(fmt.Sprintf("    %s: VALUE%s\n", r, desc))
-					}
-				} else if len(params.Properties) > 0 {
-					for pname := range params.Properties {
-						guide.WriteString(fmt.Sprintf("    %s: VALUE\n", pname))
-						break // show at least one
-					}
-				}
-				guide.WriteString("  ```\n")
+			lastIssues = issues
+			for _, issue := range issues {
+				logResult("⛔", issue)
 			}
-			guide.WriteString("\nRespond NOW with the correct format.")
-			upstreamMessages = append(upstreamMessages,
-				Message{Role: "user", Content: contentFromString(guide.String())},
-			)
-		}
-
-		reply, err := callUpstream(upstreamMessages)
-		if err != nil {
-			logResult("❌", fmt.Sprintf("Upstream error: %v", err))
-			if attempt < maxRetries {
-				continue
+			if attempt == cfg.ExecutorMaxRetries {
+				break
 			}
-			return makeOpenAIResponse("Error: "+err.Error(), model, nil)
-		}
-
-		logSection("AI RESPONSE")
-		fmt.Printf("│\n%s\n│\n", prefixLines(reply, "│  "))
-
-		parsed := parseModelResponse(reply)
-
-		// Auto-correct: AI used tool name as action (e.g. "action: write_file" instead of "action: tool_call" + "name: write_file")
-		if parsed.Action != "tool_call" && parsed.Action != "answer" && validTools[parsed.Action] {
-			logResult("🔄", fmt.Sprintf("Auto-corrected action '%s' → tool_call (name: %s)", parsed.Action, parsed.Action))
-			if parsed.Name == "" {
-				parsed.Name = parsed.Action
-			}
-			parsed.Action = "tool_call"
-			// If content was set but not placed under arguments, map it to the most likely required arg.
-			if parsed.Content != "" {
-				if required, ok := toolRequiredArgs[parsed.Name]; ok && len(required) > 0 {
-					if parsed.Arguments == nil {
-						parsed.Arguments = map[string]interface{}{}
-					}
-					targetArg := required[0]
-					for _, r := range required {
-						if r == "content" {
-							targetArg = r
-							break
-						}
-					}
-					if _, exists := parsed.Arguments[targetArg]; !exists {
-						parsed.Arguments[targetArg] = parsed.Content
-						parsed.Content = ""
-						logResult("🔄", fmt.Sprintf("Auto-mapped content → %s arg", targetArg))
-					}
-				}
-			}
-		}
-
-		logKV("Action", parsed.Action)
-
-		// Detect orphaned arguments before action: (AI tried to call tool but formatted wrong)
-		if parsed.Action == "answer" && hasOrphanedArgs(reply) {
-			orphanedKey := getOrphanedArgKey(reply)
-			if containsRefusal(parsed.Content) {
-				logResult("⚠️", fmt.Sprintf("Orphaned args + refusal detected, will retry (%d/%d)", attempt, maxRetries))
-			} else {
-				logResult("⚠️", fmt.Sprintf("Detected orphaned args before action, will retry (%d/%d)", attempt, maxRetries))
-			}
-			// Guess the tool based on orphaned key
-			guessedTool := ""
-			guessedArgs := map[string]string{}
-			switch orphanedKey {
-			case "query":
-				guessedTool = "web_search"
-				guessedArgs["query"] = "USER_QUERY_HERE"
-			case "url":
-				guessedTool = "web_fetch"
-				guessedArgs["url"] = "URL_HERE"
-			case "command":
-				guessedTool = "exec"
-				guessedArgs["command"] = "COMMAND_HERE"
-			case "path":
-				guessedTool = "read_file"
-				guessedArgs["path"] = "FILE_PATH_HERE"
-			}
-			baseMsg := fmt.Sprintf("WRONG. You put '%s:' without proper tool_call format. You HAVE the tools. Do NOT refuse.", orphanedKey)
-			upstreamMessages = append(upstreamMessages,
-				Message{Role: "assistant", Content: contentFromString(reply)},
-				Message{Role: "user", Content: escalatedCorrection(attempt, baseMsg, guessedTool, guessedArgs)},
+			messages = append(messages,
+				Message{Role: "assistant", Content: contentFromString(strings.TrimSpace(reply))},
+				Message{Role: "user", Content: contentFromString(buildToolExecutionCorrection(*toolStep, issues, attempt+1))},
 			)
 			continue
 		}
 
-		switch parsed.Action {
-		case "answer":
-			// Detect empty answer
-			if attempt < maxRetries && strings.TrimSpace(parsed.Content) == "" {
-				logResult("⚠️", fmt.Sprintf("Empty answer, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("Your answer is EMPTY. You must either:\n1) Use a tool to complete the task:\naction: tool_call\nname: TOOL_NAME\narguments:\n  param: value\n2) Or give a real answer:\naction: answer\ncontent: |\n  your actual response here\n\nDo NOT return empty content.")},
-				)
-				continue
-			}
-			// Detect hallucinated content (fake image refs, citations, etc.)
-			if attempt < maxRetries && containsHallucination(parsed.Content) {
-				logResult("⚠️", fmt.Sprintf("Hallucinated content detected, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("WRONG. Your response contains FAKE/HALLUCINATED content (fake image references, fake citations, fake search results). Do NOT invent data.\nEither use a tool to get REAL data, or give an honest answer based on actual tool results you received.")},
-				)
-				continue
-			}
-			// Detect refusal: AI says "I cannot" but has tools that can do it
-			if attempt < maxRetries && containsRefusal(parsed.Content) {
-				logResult("⚠️", fmt.Sprintf("AI refused task but has tools available, will retry (%d/%d)", attempt, maxRetries))
-				// Try to guess what tool the user needs based on their message
-				lastUserMsg := ""
-				for i := len(reqBody.Messages) - 1; i >= 0; i-- {
-					if reqBody.Messages[i].Role == "user" {
-						lastUserMsg = strings.ToLower(reqBody.Messages[i].ContentString())
-						break
-					}
-				}
-				guessedTool := "exec"
-				guessedArgs := map[string]string{"command": "COMMAND_HERE"}
-				if strings.Contains(lastUserMsg, "tìm") || strings.Contains(lastUserMsg, "search") || strings.Contains(lastUserMsg, "find") {
-					guessedTool = "web_search"
-					guessedArgs = map[string]string{"query": "SEARCH_QUERY_HERE"}
-				} else if strings.Contains(lastUserMsg, "vào") || strings.Contains(lastUserMsg, "mở") || strings.Contains(lastUserMsg, "url") || strings.Contains(lastUserMsg, "http") {
-					guessedTool = "web_fetch"
-					guessedArgs = map[string]string{"url": "URL_HERE"}
-				} else if strings.Contains(lastUserMsg, "tạo") || strings.Contains(lastUserMsg, "viết") || strings.Contains(lastUserMsg, "write") {
-					guessedTool = "write_file"
-					guessedArgs = map[string]string{"path": "FILE_PATH", "content": "CONTENT"}
-				}
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: escalatedCorrection(attempt, "Do NOT refuse. You HAVE tools. Use them.", guessedTool, guessedArgs)},
-				)
-				continue
-			}
-			// Detect unresolved specific-data requests: generic answer or ungrounded numbers after tool usage.
-			if attempt < maxRetries && userNeedsSpecificData(reqBody.Messages) {
-				recentToolText, recentToolNames := getRecentToolContext(reqBody.Messages, 6)
-				if strings.TrimSpace(recentToolText) != "" {
-					hasFetchLikeStep := recentToolNames["web_fetch"] || recentToolNames["read_file"] || recentToolNames["exec"]
+		issues := validateFinalReply(reply)
+		if len(issues) == 0 {
+			return makeOpenAIResponse(reply, model, nil), nil
+		}
+		lastIssues = issues
+		for _, issue := range issues {
+			logResult("⛔", issue)
+		}
+		if attempt == cfg.ExecutorMaxRetries {
+			break
+		}
+		messages = append(messages,
+			Message{Role: "assistant", Content: contentFromString(strings.TrimSpace(reply))},
+			Message{Role: "user", Content: contentFromString(buildFinalExecutionCorrection(issues, attempt+1))},
+		)
+	}
 
-					if !hasFetchLikeStep && !answerHasConcreteData(parsed.Content) {
-						logResult("⚠️", fmt.Sprintf("Specific-data request answered without concrete data, will retry (%d/%d)", attempt, maxRetries))
-						upstreamMessages = append(upstreamMessages,
-							Message{Role: "assistant", Content: contentFromString(reply)},
-							Message{Role: "user", Content: correction("WRONG. The user asked for specific current data. A generic link or vague summary is NOT enough. Use another tool step to fetch/read the source that contains the exact values, then answer with those exact values. Do NOT stop at search results.")},
-						)
-						continue
-					}
+	return ChatResponse{}, fmt.Errorf(
+		"executor could not produce a valid result after %d attempt(s): %s; last reply=%s",
+		cfg.ExecutorMaxRetries,
+		strings.Join(lastIssues, "; "),
+		summarizeText(lastReply, 1500),
+	)
+}
 
-					if hasFetchLikeStep && !answerHasConcreteData(parsed.Content) && answerLooksLikeGenericReference(parsed.Content) {
-						logResult("⚠️", fmt.Sprintf("Fetched source but answer stayed generic, will retry (%d/%d)", attempt, maxRetries))
-						upstreamMessages = append(upstreamMessages,
-							Message{Role: "assistant", Content: contentFromString(reply)},
-							Message{Role: "user", Content: correction("WRONG. You already fetched/read source data, so now answer with the exact values from the tool results. Do NOT answer with only a link, a referral, or a vague statement.")},
-						)
-						continue
-					}
+func processToolAwareRequest(req ChatRequest) ChatResponse {
+	model := resolvedChatModel(req.Model)
+	registry := buildToolRegistry(req.Tools)
+	if len(registry) == 0 {
+		return makeOpenAIResponse("Error: tool mode requested but no valid tools were provided.", model, nil)
+	}
 
-					if hasFetchLikeStep && answerHasConcreteData(parsed.Content) && !answerNumbersGroundedInToolResults(parsed.Content, reqBody.Messages) {
-						logResult("⚠️", fmt.Sprintf("Numeric answer is not grounded in recent tool results, will retry (%d/%d)", attempt, maxRetries))
-						upstreamMessages = append(upstreamMessages,
-							Message{Role: "assistant", Content: contentFromString(reply)},
-							Message{Role: "user", Content: correction("WRONG. Your numeric answer is not clearly grounded in the recent tool results. Do NOT estimate, round, or invent values. Read the fetched tool output carefully and answer using the exact numbers that appear there, or call another tool to get clearer source data.")},
-						)
-						continue
-					}
-				}
-			}
-			// Detect: user asked to DO something but AI answered without using any tool
-			if attempt < maxRetries && userAskedForAction(reqBody.Messages) && !hasToolResultInRecent(reqBody.Messages) {
-				logResult("⚠️", fmt.Sprintf("User asked for action but AI answered without tool, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: escalatedCorrection(attempt, "I asked you to DO something, not explain. Use a tool NOW.", "exec", map[string]string{"command": "RELEVANT_COMMAND"})},
-				)
-				continue
-			}
-			// Detect lazy AI: answering with code instead of using write_file tool
-			if attempt < maxRetries && validTools["write_file"] && containsCode(parsed.Content) {
-				logResult("⚠️", fmt.Sprintf("Answer contains code, should use write_file, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("WRONG. Do NOT paste code in your answer. Use write_file tool to create the file, then confirm. You MUST use tools to complete tasks, not show code to the user.\naction: tool_call\nname: write_file\narguments:\n  path: appropriate_filename\n  content: the full code")},
-				)
-				continue
-			}
-			// Detect fabrication: AI claims it did something but no tool was called
-			if attempt < maxRetries && claimsDoneWithoutTool(parsed.Content, reqBody.Messages) {
-				logResult("⚠️", fmt.Sprintf("AI claims action done but no tool was called, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("WRONG. You claimed you did something but you did NOT actually call any tool. Do NOT fabricate results. Use the appropriate tool NOW to actually complete the task. Call action: tool_call with the right tool.")},
-				)
-				continue
-			}
-			// Detect generic stop/progress update while the task still appears incomplete.
-			if attempt < maxRetries && conversationStillNeedsAction(reqBody.Messages) && answerLooksLikeProgressOnly(parsed.Content) {
-				logResult("⚠️", fmt.Sprintf("Task appears incomplete but answer stopped early, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("WRONG. The task is not fully completed yet. Do not stop with a progress update, status message, generic reference, or partial completion. Infer the next missing step from the conversation history and recent tool results, then do that next step now.")},
-				)
-				continue
-			}
-			// Detect skip-verify: AI gives final answer right after write/exec without verifying
-			if attempt < maxRetries && needsVerification(reqBody.Messages) {
-				logResult("⚠️", fmt.Sprintf("Answer after write/exec without verification, will retry (%d/%d)", attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction("STOP. Before giving final answer, you MUST verify your work. Use read_file to check the file you created, or list_dir to confirm it exists. Verify first, then answer.")},
-				)
-				continue
-			}
-			logResult("💬", "Final answer")
-			return makeOpenAIResponse(parsed.Content, model, nil)
+	planKey := latestUserTurnKey(req.Messages)
+	var originalPlan ToonPlan
+	var currentPlan ToonPlan
 
-		case "tool_call":
-			// Validate tool call
-			if parsed.Name == "" {
-				logResult("⚠️", fmt.Sprintf("Empty tool name, will retry (%d/%d)", attempt, maxRetries))
-				validNames := make([]string, 0, len(validTools))
-				for name := range validTools {
-					validNames = append(validNames, name)
-				}
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction(fmt.Sprintf("Your tool_call is missing \"name\". Available tools: %s\nCorrect format:\naction: tool_call\nname: %s\narguments:\n  param: value", strings.Join(validNames, ", "), validNames[0]))},
-				)
-				continue
-			}
-			if !validTools[parsed.Name] {
-				validNames := make([]string, 0, len(validTools))
-				for name := range validTools {
-					validNames = append(validNames, name)
-				}
-				logResult("⚠️", fmt.Sprintf("Unknown tool '%s', will retry (%d/%d)", parsed.Name, attempt, maxRetries))
-				upstreamMessages = append(upstreamMessages,
-					Message{Role: "assistant", Content: contentFromString(reply)},
-					Message{Role: "user", Content: correction(fmt.Sprintf(
-						"Error: \"%s\" is NOT a valid tool. Available: %s\nCorrect format:\naction: tool_call\nname: %s\narguments:\n  param: value\nDo NOT invent tool names.", parsed.Name, strings.Join(validNames, ", "), validNames[0]))},
-				)
-				continue
-			}
-
-			argsJSON, _ := json.Marshal(parsed.Arguments)
-
-			// Check required arguments
-			if required, ok := toolRequiredArgs[parsed.Name]; ok && len(required) > 0 {
-				var missing []string
-				for _, r := range required {
-					if parsed.Arguments == nil {
-						missing = append(missing, r)
-					} else if _, exists := parsed.Arguments[r]; !exists {
-						missing = append(missing, r)
-					}
-				}
-				if len(missing) > 0 {
-					currentError := fmt.Sprintf("missing_%s_%s", parsed.Name, strings.Join(missing, ","))
-					if currentError == lastError {
-						sameErrorCount++
-					} else {
-						sameErrorCount = 1
-						lastError = currentError
-					}
-
-					logResult("⚠️", fmt.Sprintf("Missing required args %v for '%s', will retry (%d/%d, same error x%d)", missing, parsed.Name, attempt, maxRetries, sameErrorCount))
-
-					var correctionMsg string
-					if sameErrorCount >= 2 {
-						// Escalated prompt - be very explicit with filled example
-						argsExample := ""
-						for _, r := range required {
-							argsExample += fmt.Sprintf("  %s: YOUR_VALUE_HERE\n", r)
-						}
-						correctionMsg = fmt.Sprintf("You keep making the SAME mistake. Let me be very clear.\n\nYou MUST respond with EXACTLY this structure (fill in real values):\naction: tool_call\nname: %s\narguments:\n%s\nDo NOT put values after 'action:' or 'content:'. Put them ONLY under 'arguments:' with 2-space indent.", parsed.Name, argsExample)
-					} else {
-						correctionMsg = fmt.Sprintf(
-							"Error: tool \"%s\" requires arguments: %s, but you are missing: %s\nCorrect format:\naction: tool_call\nname: %s\narguments:\n  %s: value",
-							parsed.Name, strings.Join(required, ", "), strings.Join(missing, ", "), parsed.Name, missing[0])
-					}
-
-					upstreamMessages = append(upstreamMessages,
-						Message{Role: "assistant", Content: contentFromString(reply)},
-						Message{Role: "user", Content: correction(correctionMsg)},
-					)
-					continue
-				}
-			}
-
-			logResult("🔧", fmt.Sprintf("Tool call: %s(%s)", parsed.Name, string(argsJSON)))
-
-			toolCallID := fmt.Sprintf("call_%s", uuid.New().String()[:8])
-			toolCalls := []ToolCall{{
-				ID:   toolCallID,
-				Type: "function",
-				Function: FunctionCall{
-					Name:      parsed.Name,
-					Arguments: string(argsJSON),
-				},
-			}}
-			return makeOpenAIResponse("", model, toolCalls)
-
-		default:
-			validNames := make([]string, 0, len(validTools))
-			for name := range validTools {
-				validNames = append(validNames, name)
-			}
-			logResult("⚠️", fmt.Sprintf("Invalid action '%s', will retry (%d/%d)", parsed.Action, attempt, maxRetries))
-			correctionMsg := fmt.Sprintf(`WRONG. You used action: %s which is invalid.
-
-You MUST respond in TOON format with action being ONLY "tool_call" or "answer":
-
-To call a tool:
-action: tool_call
-name: TOOL_NAME
-arguments:
-  param: value
-Available tools: %s
-
-To give final answer:
-action: answer
-content: |
-  your answer here
-
-Do NOT invent actions like "exec", "run", "execute". Respond NOW correctly.`, parsed.Action, strings.Join(validNames, ", "))
-			upstreamMessages = append(upstreamMessages,
-				Message{Role: "assistant", Content: contentFromString(reply)},
-				Message{Role: "user", Content: correction(correctionMsg)},
-			)
-			continue
+	if planKey != "" {
+		if state, ok := planStore.get(planKey); ok {
+			completed := countCompletedPlanSteps(req.Messages, state.Plan)
+			originalPlan = state.Plan
+			currentPlan = remainingPlanFromProgress(state.Plan, completed)
+			logSection("RESUMED PLAN")
+			logKV("Plan key", planKey[:12])
+			logKV("Completed", fmt.Sprintf("%d/%d", completed, len(state.Plan.Steps)))
 		}
 	}
 
-	logResult("❌", "Failed after max retries")
-	return makeOpenAIResponse("Error: failed after max retries", model, nil)
+	if len(currentPlan.Steps) == 0 && strings.TrimSpace(currentPlan.Final) == "" {
+		plan, err := requestValidatedPlan(req, registry)
+		if err != nil {
+			return makeOpenAIResponse("Planner error: "+err.Error(), model, nil)
+		}
+		originalPlan = plan
+		currentPlan = plan
+		if planKey != "" && len(plan.Steps) > 0 {
+			planStore.put(planKey, plan)
+		}
+	}
+
+	logSection("VALIDATED PLAN")
+	fmt.Printf("│\n%s\n", prefixLines(renderToonPlan(currentPlan), "│  "))
+
+	result, err := runExecutor(req, currentPlan, registry)
+	if err != nil {
+		return makeOpenAIResponse("Execution error: "+err.Error(), model, nil)
+	}
+
+	if planKey != "" {
+		if len(result.Choices) > 0 && result.Choices[0].FinishReason == "tool_calls" {
+			if len(originalPlan.Steps) > 0 {
+				planStore.put(planKey, originalPlan)
+			}
+		} else {
+			planStore.delete(planKey)
+		}
+	}
+	return result
 }
 
-// ============================================================
-// HTTP Server
-// ============================================================
-func handleModels(w http.ResponseWriter, r *http.Request) {
-	resp := map[string]interface{}{
+func handleModels(w http.ResponseWriter, _ *http.Request) {
+	sendJSON(w, map[string]interface{}{
 		"object": "list",
 		"data": []map[string]interface{}{{
-			"id":       UpstreamModel,
+			"id":       cfg.UpstreamModel,
 			"object":   "model",
 			"owned_by": "proxy",
 		}},
+	}, http.StatusOK)
+}
+
+func summarizeText(text string, limit int) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.TrimSpace(text)
+	if limit > 0 && len(text) > limit {
+		return text[:limit] + "..."
 	}
-	sendJSON(w, resp, http.StatusOK)
+	return text
+}
+
+func sanitizeLogMultiline(text string) string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	return strings.TrimSpace(text)
+}
+
+func oneLineLogPreview(text string, limit int) string {
+	text = strings.ReplaceAll(sanitizeLogMultiline(text), "\n", " ")
+	text = strings.Join(strings.Fields(text), " ")
+	if limit > 0 && len(text) > limit {
+		return text[:limit] + "..."
+	}
+	return text
+}
+
+func prefixLines(text, prefix string) string {
+	lines := strings.Split(sanitizeLogMultiline(text), "\n")
+	for i := range lines {
+		lines[i] = prefix + lines[i]
+	}
+	return strings.Join(lines, "\n")
 }
 
 func logHeader(method, path string) {
-	now := time.Now().Format("15:04:05")
 	fmt.Printf("\n┌─────────────────────────────────────────────\n")
-	fmt.Printf("│ %s  %s %s\n", now, method, path)
+	fmt.Printf("│ %s  %s %s\n", time.Now().Format("15:04:05"), method, path)
 	fmt.Printf("├─────────────────────────────────────────────\n")
 }
 
@@ -1811,30 +1587,21 @@ func logSection(label string) {
 }
 
 func logKV(key, value string) {
-	fmt.Printf("│  %-14s %s\n", key+":", value)
+	fmt.Printf("│  %-14s %s\n", key+":", oneLineLogPreview(value, 160))
 }
 
 func logResult(icon, msg string) {
-	fmt.Printf("│  %s %s\n", icon, msg)
+	fmt.Printf("│  %s %s\n", icon, oneLineLogPreview(msg, 220))
 }
 
-func logFooter(duration time.Duration, finishReason string) {
+func logFooter(duration time.Duration, result string) {
 	fmt.Printf("├─────────────────────────────────────────────\n")
-	fmt.Printf("│  Result: %-12s  Duration: %v\n", finishReason, duration.Round(time.Millisecond))
+	fmt.Printf("│  Result: %-12s  Duration: %v\n", result, duration.Round(time.Millisecond))
 	fmt.Printf("└─────────────────────────────────────────────\n")
-}
-
-func prefixLines(text, prefix string) string {
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		lines[i] = prefix + line
-	}
-	return strings.Join(lines, "\n")
 }
 
 func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-
 	if r.Method != http.MethodPost {
 		sendJSON(w, map[string]string{"error": "Method not allowed"}, http.StatusMethodNotAllowed)
 		return
@@ -1846,72 +1613,58 @@ func handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var reqBody ChatRequest
-	if err := json.Unmarshal(body, &reqBody); err != nil {
+	hasTools, err := requestHasTools(body)
+	if err != nil {
+		sendJSON(w, map[string]string{"error": "Invalid JSON"}, http.StatusBadRequest)
+		return
+	}
+	if !hasTools {
+		status, headers, data, err := proxyUpstreamRaw(body)
+		if err != nil {
+			sendJSON(w, map[string]string{"error": "Upstream request failed: " + err.Error()}, http.StatusBadGateway)
+			return
+		}
+		for key, values := range headers {
+			if strings.EqualFold(key, "Content-Length") {
+				continue
+			}
+			for _, value := range values {
+				w.Header().Add(key, value)
+			}
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(data)
+		return
+	}
+
+	var req ChatRequest
+	if err := json.Unmarshal(body, &req); err != nil {
 		sendJSON(w, map[string]string{"error": "Invalid JSON"}, http.StatusBadRequest)
 		return
 	}
 
 	logHeader(r.Method, r.URL.Path)
 	logSection("REQUEST")
-	logKV("Model", reqBody.Model)
-	logKV("Messages", fmt.Sprintf("%d", len(reqBody.Messages)))
-	logKV("Tools", fmt.Sprintf("%d", len(reqBody.Tools)))
-
-	// Log last user message
-	for i := len(reqBody.Messages) - 1; i >= 0; i-- {
-		if reqBody.Messages[i].Role == "user" && !reqBody.Messages[i].ContentIsNull() {
-			content := reqBody.Messages[i].ContentString()
-			if len(content) > 100 {
-				content = content[:100] + "..."
-			}
-			logKV("Last user msg", content)
-			break
-		}
+	logKV("Model", resolvedChatModel(req.Model))
+	logKV("Messages", strconv.Itoa(len(req.Messages)))
+	logKV("Tools", strconv.Itoa(len(req.Tools)))
+	if req.Stream && len(req.Tools) > 0 {
+		logResult("⚠️", "stream=true requested; returning non-stream JSON in tool-aware mode")
+	}
+	if latest := latestUserRequest(req.Messages); latest != "" {
+		logKV("Last user msg", latest)
 	}
 
-	// Log tool results if present
-	for _, msg := range reqBody.Messages {
-		if msg.Role == "tool" {
-			content := msg.ContentString()
-			if len(content) > 80 {
-				content = content[:80] + "..."
-			}
-			logResult("📎", fmt.Sprintf("Tool result [%s]: %s", msg.Name, content))
-		}
+	result := processToolAwareRequest(req)
+	finishReason := "stop"
+	if len(result.Choices) > 0 {
+		finishReason = result.Choices[0].FinishReason
 	}
-
-	if len(reqBody.Tools) == 0 {
-		status, headers, respBody, err := proxyUpstreamRaw(body)
-		if err != nil {
-			logFooter(time.Since(start), "error")
-			sendJSON(w, map[string]string{"error": "Upstream request failed: " + err.Error()}, http.StatusBadGateway)
-			return
-		}
-		logResult("↪", fmt.Sprintf("Passthrough upstream response (%d)", status))
-		logFooter(time.Since(start), "passthrough")
-
-		for k, values := range headers {
-			if strings.EqualFold(k, "Content-Length") {
-				continue
-			}
-			for _, v := range values {
-				w.Header().Add(k, v)
-			}
-		}
-		w.WriteHeader(status)
-		w.Write(respBody)
-		return
-	}
-
-	result := processChatRequest(reqBody)
-
-	finishReason := result.Choices[0].FinishReason
 	logFooter(time.Since(start), finishReason)
 	sendJSON(w, result, http.StatusOK)
 }
 
-func handleDefault(w http.ResponseWriter, r *http.Request) {
+func handleDefault(w http.ResponseWriter, _ *http.Request) {
 	sendJSON(w, map[string]string{"status": "ok"}, http.StatusOK)
 }
 
@@ -1923,16 +1676,21 @@ func sendJSON(w http.ResponseWriter, data interface{}, status int) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	w.Write(body)
+	_, _ = w.Write(body)
 }
 
 func main() {
 	initConfig()
 
 	fmt.Println("Tool-calling proxy server")
-	fmt.Printf("  Listening:  http://localhost:%s\n", ProxyPort)
-	fmt.Printf("  Upstream:   %s\n", UpstreamURL)
-	fmt.Printf("  Model:      %s\n", UpstreamModel)
+	fmt.Printf("  Listening:      http://localhost:%s\n", cfg.ProxyPort)
+	fmt.Printf("  Upstream:       %s\n", cfg.UpstreamURL)
+	fmt.Printf("  Chat model:     %s\n", cfg.UpstreamModel)
+	if strings.TrimSpace(cfg.PlannerModel) != "" {
+		fmt.Printf("  Planner model:  %s\n", cfg.PlannerModel)
+	}
+	fmt.Printf("  Planner retry:  %d\n", cfg.PlannerMaxAttempts)
+	fmt.Printf("  Executor retry: %d\n", cfg.ExecutorMaxRetries)
 	fmt.Println()
 
 	mux := http.NewServeMux()
@@ -1941,7 +1699,7 @@ func main() {
 	mux.HandleFunc("/", handleDefault)
 
 	server := &http.Server{
-		Addr:    ":" + ProxyPort,
+		Addr:    ":" + cfg.ProxyPort,
 		Handler: mux,
 	}
 	log.Fatal(server.ListenAndServe())
