@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	toon "github.com/toon-format/toon-go"
 )
 
 type Config struct {
@@ -241,6 +243,71 @@ type executorPayload struct {
 	AvailableTools    []ToolSpec          `json:"available_tools,omitempty"`
 	Plan              executorPlanView    `json:"plan"`
 	CurrentStep       executorStepView    `json:"current_step"`
+}
+
+type toonConversationToolCallDoc struct {
+	Name      string            `toon:"name"`
+	Arguments map[string]string `toon:"arguments,omitempty"`
+}
+
+type toonConversationEntryDoc struct {
+	Role      string                        `toon:"role"`
+	Name      string                        `toon:"name,omitempty"`
+	Content   string                        `toon:"content,omitempty"`
+	ToolCalls []toonConversationToolCallDoc `toon:"tool_calls,omitempty"`
+}
+
+type toonParameterDoc struct {
+	Name        string `toon:"name"`
+	Type        string `toon:"type"`
+	Description string `toon:"description,omitempty"`
+}
+
+type toonToolSpecDoc struct {
+	Name        string             `toon:"name"`
+	Description string             `toon:"description,omitempty"`
+	Required    []string           `toon:"required,omitempty"`
+	Parameters  []toonParameterDoc `toon:"parameters,omitempty"`
+}
+
+type toonExecutionTraceDoc struct {
+	Kind    string `toon:"kind"`
+	Tool    string `toon:"tool,omitempty"`
+	Summary string `toon:"summary"`
+}
+
+type toonPlanNoteDoc struct {
+	Use    string `toon:"use,omitempty"`
+	Why    string `toon:"why,omitempty"`
+	Output string `toon:"output,omitempty"`
+	Input  string `toon:"input,omitempty"`
+}
+
+type toonExecutorStepDoc struct {
+	Type   string           `toon:"type"`
+	Number int              `toon:"number,omitempty"`
+	Tool   string           `toon:"tool,omitempty"`
+	Note   *toonPlanNoteDoc `toon:"note,omitempty"`
+}
+
+type toonExecutorPlanDoc struct {
+	Steps []toonExecutorStepDoc `toon:"steps,omitempty"`
+	Final string                `toon:"final,omitempty"`
+}
+
+type toonPlannerPayloadDoc struct {
+	LatestUserRequest string                     `toon:"LATEST_USER_REQUEST,omitempty"`
+	Conversation      []toonConversationEntryDoc `toon:"CONVERSATION"`
+	AvailableTools    []toonToolSpecDoc          `toon:"AVAILABLE_TOOLS,omitempty"`
+	ExecutionTrace    []toonExecutionTraceDoc    `toon:"EXECUTION_TRACE,omitempty"`
+}
+
+type toonExecutorPayloadDoc struct {
+	LatestUserRequest string                     `toon:"LATEST_USER_REQUEST,omitempty"`
+	Conversation      []toonConversationEntryDoc `toon:"CONVERSATION"`
+	AvailableTools    []toonToolSpecDoc          `toon:"AVAILABLE_TOOLS,omitempty"`
+	Plan              toonExecutorPlanDoc        `toon:"PLAN"`
+	CurrentStep       toonExecutorStepDoc        `toon:"CURRENT_STEP"`
 }
 
 type compactionProfile struct {
@@ -732,7 +799,144 @@ func doUpstreamRequest(body []byte) (int, http.Header, []byte, error) {
 	return resp.StatusCode, headers, data, nil
 }
 
+func extractTextFromUpstreamChunk(chunk upstreamResponse) string {
+	if len(chunk.Choices) == 0 {
+		return ""
+	}
+	if chunk.Choices[0].Delta.Content != "" {
+		return chunk.Choices[0].Delta.Content
+	}
+	return chunk.Choices[0].Message.Content
+}
+
+func extractTextFromUpstreamData(data []byte, headers http.Header) string {
+	if strings.Contains(strings.ToLower(headers.Get("Content-Type")), "application/json") {
+		var raw map[string]interface{}
+		if err := json.Unmarshal(data, &raw); err == nil {
+			if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
+				if choice, ok := choices[0].(map[string]interface{}); ok {
+					if msg, ok := choice["message"].(map[string]interface{}); ok {
+						if content, ok := msg["content"].(string); ok {
+							return content
+						}
+					}
+				}
+			}
+		}
+	}
+
+	var fullText strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		chunkPayload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if chunkPayload == "[DONE]" {
+			break
+		}
+		var chunk upstreamResponse
+		if err := json.Unmarshal([]byte(chunkPayload), &chunk); err != nil {
+			continue
+		}
+		fullText.WriteString(extractTextFromUpstreamChunk(chunk))
+	}
+	if fullText.Len() > 0 {
+		return fullText.String()
+	}
+	return string(data)
+}
+
+func doUpstreamTextRequest(body []byte, stopWhen func(string) bool) (int, http.Header, string, []byte, error) {
+	if stopWhen == nil {
+		status, headers, data, err := doUpstreamRequest(body)
+		if err != nil {
+			return 0, nil, "", nil, err
+		}
+		return status, headers, extractTextFromUpstreamData(data, headers), data, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.UpstreamURL, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, "", nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if cfg.UpstreamAPIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.UpstreamAPIKey)
+	}
+
+	client := &http.Client{Timeout: cfg.HTTPTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, nil, "", nil, err
+	}
+	defer resp.Body.Close()
+
+	headers := make(http.Header)
+	for key, values := range resp.Header {
+		for _, value := range values {
+			headers.Add(key, value)
+		}
+	}
+	if resp.StatusCode != http.StatusOK {
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return 0, nil, "", nil, err
+		}
+		return resp.StatusCode, headers, "", data, nil
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var raw bytes.Buffer
+	var fullText strings.Builder
+	for {
+		line, readErr := reader.ReadString('\n')
+		if len(line) > 0 {
+			raw.WriteString(line)
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "data: ") {
+				chunkPayload := strings.TrimSpace(strings.TrimPrefix(trimmed, "data: "))
+				if chunkPayload == "[DONE]" {
+					break
+				}
+				var chunk upstreamResponse
+				if json.Unmarshal([]byte(chunkPayload), &chunk) == nil {
+					if delta := extractTextFromUpstreamChunk(chunk); delta != "" {
+						fullText.WriteString(delta)
+						if stopWhen(fullText.String()) {
+							logResult("⚡", "stream already contains a complete structured reply; stopping upstream stream early")
+							cancel()
+							_ = resp.Body.Close()
+							return resp.StatusCode, headers, fullText.String(), raw.Bytes(), nil
+						}
+					}
+				}
+			}
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return 0, nil, "", nil, readErr
+		}
+	}
+
+	data := raw.Bytes()
+	text := fullText.String()
+	if text == "" {
+		text = extractTextFromUpstreamData(data, headers)
+	}
+	return resp.StatusCode, headers, text, data, nil
+}
+
 func callUpstreamText(model string, messages []Message) (string, error) {
+	return callUpstreamTextUntil(model, messages, nil)
+}
+
+func callUpstreamTextUntil(model string, messages []Message, stopWhen func(string) bool) (string, error) {
 	const maxCompactionAttempts = 4
 
 	var lastErr error
@@ -748,7 +952,7 @@ func callUpstreamText(model string, messages []Message) (string, error) {
 		payload := map[string]interface{}{
 			"model":       resolvedChatModel(model),
 			"messages":    currentMessages,
-			"stream":      false,
+			"stream":      stopWhen != nil,
 			"temperature": 0,
 		}
 		body, _ := json.Marshal(payload)
@@ -762,7 +966,7 @@ func callUpstreamText(model string, messages []Message) (string, error) {
 			continue
 		}
 
-		status, headers, data, err := doUpstreamRequest(body)
+		status, _, text, data, err := doUpstreamTextRequest(body, stopWhen)
 		if err != nil {
 			return "", err
 		}
@@ -774,44 +978,7 @@ func callUpstreamText(model string, messages []Message) (string, error) {
 			}
 			return "", lastErr
 		}
-
-		if strings.Contains(strings.ToLower(headers.Get("Content-Type")), "application/json") {
-			var raw map[string]interface{}
-			if err := json.Unmarshal(data, &raw); err == nil {
-				if choices, ok := raw["choices"].([]interface{}); ok && len(choices) > 0 {
-					if choice, ok := choices[0].(map[string]interface{}); ok {
-						if msg, ok := choice["message"].(map[string]interface{}); ok {
-							if content, ok := msg["content"].(string); ok {
-								return content, nil
-							}
-						}
-					}
-				}
-			}
-		}
-
-		var fullText strings.Builder
-		for _, line := range strings.Split(string(data), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "data: ") {
-				continue
-			}
-			chunkPayload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
-			if chunkPayload == "[DONE]" {
-				break
-			}
-			var chunk upstreamResponse
-			if err := json.Unmarshal([]byte(chunkPayload), &chunk); err != nil {
-				continue
-			}
-			if len(chunk.Choices) > 0 {
-				fullText.WriteString(chunk.Choices[0].Delta.Content)
-			}
-		}
-		if fullText.Len() > 0 {
-			return fullText.String(), nil
-		}
-		return string(data), nil
+		return text, nil
 	}
 
 	if lastErr != nil {
@@ -1253,8 +1420,8 @@ func latestRequestLikelyNeedsTool(messages []Message) bool {
 	keywords := []string{
 		"check", "run", "read", "write", "save", "send", "search", "find", "delete", "remove",
 		"edit", "append", "create", "generate", "export", "build", "compile", "code",
-		"kiem tra", "đọc", "doc", "ghi", "luu", "lưu", "gui", "gửi", "tim", "tìm",
-		"xoa", "xóa", "sua", "sửa", "them", "thêm", "tao", "tạo", "viet", "viết",
+		"kiem tra", "đọc", "doc", "ghi", "luu", "lưu", "gửi", "tìm",
+		"xóa", "sửa", "thêm", "tạo", "viet", "viết",
 		"chay", "chạy", "file", "folder", "server", "ram", "api", "deploy", "log",
 	}
 	for _, keyword := range keywords {
@@ -1513,6 +1680,335 @@ func marshalPrettyJSON(value interface{}) string {
 		return "{}"
 	}
 	return string(body)
+}
+
+func toonIndent(level int) string {
+	if level <= 0 {
+		return ""
+	}
+	return strings.Repeat("  ", level)
+}
+
+func renderToonGo(value interface{}) (string, error) {
+	body, err := toon.MarshalString(value, toon.WithLengthMarkers(true))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(body), nil
+}
+
+func toToonConversationToolCalls(calls []ConversationToolCall) []toonConversationToolCallDoc {
+	if len(calls) == 0 {
+		return nil
+	}
+	result := make([]toonConversationToolCallDoc, 0, len(calls))
+	for _, call := range calls {
+		doc := toonConversationToolCallDoc{
+			Name: strings.TrimSpace(call.Name),
+		}
+		if len(call.Arguments) > 0 {
+			args := make(map[string]string, len(call.Arguments))
+			keys := make([]string, 0, len(call.Arguments))
+			for key := range call.Arguments {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				args[key] = compactArgumentValue(call.Arguments[key])
+			}
+			doc.Arguments = args
+		}
+		result = append(result, doc)
+	}
+	return result
+}
+
+func toToonConversation(entries []ConversationEntry) []toonConversationEntryDoc {
+	if len(entries) == 0 {
+		return nil
+	}
+	result := make([]toonConversationEntryDoc, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, toonConversationEntryDoc{
+			Role:      strings.TrimSpace(entry.Role),
+			Name:      strings.TrimSpace(entry.Name),
+			Content:   strings.TrimSpace(entry.Content),
+			ToolCalls: toToonConversationToolCalls(entry.ToolCalls),
+		})
+	}
+	return result
+}
+
+func toToonToolSpecs(specs []ToolSpec) []toonToolSpecDoc {
+	if len(specs) == 0 {
+		return nil
+	}
+	result := make([]toonToolSpecDoc, 0, len(specs))
+	for _, spec := range specs {
+		doc := toonToolSpecDoc{
+			Name:        strings.TrimSpace(spec.Name),
+			Description: strings.TrimSpace(spec.Description),
+			Required:    append([]string(nil), spec.Required...),
+		}
+		if len(spec.Parameters) > 0 {
+			keys := make([]string, 0, len(spec.Parameters))
+			for key := range spec.Parameters {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			doc.Parameters = make([]toonParameterDoc, 0, len(keys))
+			for _, key := range keys {
+				param := spec.Parameters[key]
+				doc.Parameters = append(doc.Parameters, toonParameterDoc{
+					Name:        key,
+					Type:        strings.TrimSpace(param.Type),
+					Description: strings.TrimSpace(param.Description),
+				})
+			}
+		}
+		result = append(result, doc)
+	}
+	return result
+}
+
+func toToonExecutionTrace(trace []executionTraceEntry) []toonExecutionTraceDoc {
+	if len(trace) == 0 {
+		return nil
+	}
+	result := make([]toonExecutionTraceDoc, 0, len(trace))
+	for _, entry := range trace {
+		result = append(result, toonExecutionTraceDoc{
+			Kind:    strings.TrimSpace(entry.Kind),
+			Tool:    strings.TrimSpace(entry.Tool),
+			Summary: strings.TrimSpace(entry.Summary),
+		})
+	}
+	return result
+}
+
+func toToonPlanNote(note PlanNote) *toonPlanNoteDoc {
+	if strings.TrimSpace(note.Use) == "" &&
+		strings.TrimSpace(note.Why) == "" &&
+		strings.TrimSpace(note.Output) == "" &&
+		strings.TrimSpace(note.Input) == "" {
+		return nil
+	}
+	return &toonPlanNoteDoc{
+		Use:    strings.TrimSpace(note.Use),
+		Why:    strings.TrimSpace(note.Why),
+		Output: strings.TrimSpace(note.Output),
+		Input:  strings.TrimSpace(note.Input),
+	}
+}
+
+func toToonExecutorStep(step executorStepView) toonExecutorStepDoc {
+	return toonExecutorStepDoc{
+		Type:   strings.TrimSpace(step.Type),
+		Number: step.Number,
+		Tool:   strings.TrimSpace(step.Tool),
+		Note:   toToonPlanNote(step.Note),
+	}
+}
+
+func toonDisplayKey(key string, level int) string {
+	if level == 0 {
+		return strings.ToUpper(key)
+	}
+	return key
+}
+
+func writeToonScalarField(sb *strings.Builder, level int, key, value string) {
+	prefix := toonIndent(level)
+	key = toonDisplayKey(key, level)
+	value = normalizeMultilineText(value)
+	if value == "" {
+		sb.WriteString(prefix + key + ":\n")
+		return
+	}
+	if strings.Contains(value, "\n") {
+		sb.WriteString(prefix + key + ":\n")
+		for _, line := range strings.Split(value, "\n") {
+			sb.WriteString(prefix + "  " + line + "\n")
+		}
+		return
+	}
+	sb.WriteString(prefix + key + ": " + value + "\n")
+}
+
+func writeToonListHeader(sb *strings.Builder, level int, key string, count int) {
+	key = toonDisplayKey(key, level)
+	sb.WriteString(toonIndent(level) + fmt.Sprintf("%s: items[%d]:\n", key, count))
+}
+
+func writeToonStringList(sb *strings.Builder, level int, key string, values []string) {
+	writeToonListHeader(sb, level, key, len(values))
+	for _, value := range values {
+		sb.WriteString(toonIndent(level+1) + "- " + normalizeMultilineText(value) + "\n")
+	}
+}
+
+func writeToonArgumentMap(sb *strings.Builder, level int, key string, arguments map[string]interface{}) {
+	key = toonDisplayKey(key, level)
+	if len(arguments) == 0 {
+		sb.WriteString(toonIndent(level) + key + ":\n")
+		return
+	}
+	sb.WriteString(toonIndent(level) + key + ":\n")
+	keys := make([]string, 0, len(arguments))
+	for name := range arguments {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	for _, name := range keys {
+		writeToonScalarField(sb, level+1, name, compactArgumentValue(arguments[name]))
+	}
+}
+
+func writeToonToolCalls(sb *strings.Builder, level int, calls []ConversationToolCall) {
+	writeToonListHeader(sb, level, "tool_calls", len(calls))
+	for _, call := range calls {
+		sb.WriteString(toonIndent(level+1) + "- name: " + strings.TrimSpace(call.Name) + "\n")
+		writeToonArgumentMap(sb, level+2, "arguments", call.Arguments)
+	}
+}
+
+func writeToonConversation(sb *strings.Builder, level int, entries []ConversationEntry) {
+	writeToonListHeader(sb, level, "conversation", len(entries))
+	for _, entry := range entries {
+		sb.WriteString(toonIndent(level+1) + "- role: " + strings.TrimSpace(entry.Role) + "\n")
+		if strings.TrimSpace(entry.Name) != "" {
+			writeToonScalarField(sb, level+2, "name", entry.Name)
+		}
+		if strings.TrimSpace(entry.Content) != "" {
+			writeToonScalarField(sb, level+2, "content", entry.Content)
+		}
+		if len(entry.ToolCalls) > 0 {
+			writeToonToolCalls(sb, level+2, entry.ToolCalls)
+		}
+	}
+}
+
+func writeToonToolSpecs(sb *strings.Builder, level int, specs []ToolSpec) {
+	writeToonListHeader(sb, level, "available_tools", len(specs))
+	for _, spec := range specs {
+		sb.WriteString(toonIndent(level+1) + "- name: " + strings.TrimSpace(spec.Name) + "\n")
+		if strings.TrimSpace(spec.Description) != "" {
+			writeToonScalarField(sb, level+2, "description", spec.Description)
+		}
+		writeToonStringList(sb, level+2, "required", spec.Required)
+		sb.WriteString(toonIndent(level+2) + "parameters:\n")
+		keys := make([]string, 0, len(spec.Parameters))
+		for name := range spec.Parameters {
+			keys = append(keys, name)
+		}
+		sort.Strings(keys)
+		for _, name := range keys {
+			param := spec.Parameters[name]
+			sb.WriteString(toonIndent(level+3) + name + ":\n")
+			writeToonScalarField(sb, level+4, "type", param.Type)
+			writeToonScalarField(sb, level+4, "description", param.Description)
+		}
+	}
+}
+
+func writeToonExecutionTrace(sb *strings.Builder, level int, trace []executionTraceEntry) {
+	writeToonListHeader(sb, level, "execution_trace", len(trace))
+	for _, entry := range trace {
+		sb.WriteString(toonIndent(level+1) + "- kind: " + strings.TrimSpace(entry.Kind) + "\n")
+		if strings.TrimSpace(entry.Tool) != "" {
+			writeToonScalarField(sb, level+2, "tool", entry.Tool)
+		}
+		writeToonScalarField(sb, level+2, "summary", entry.Summary)
+	}
+}
+
+func writeToonPlanNote(sb *strings.Builder, level int, note PlanNote) {
+	sb.WriteString(toonIndent(level) + toonDisplayKey("note", level) + ":\n")
+	writeToonScalarField(sb, level+1, "use", note.Use)
+	writeToonScalarField(sb, level+1, "why", note.Why)
+	writeToonScalarField(sb, level+1, "output", note.Output)
+	if strings.TrimSpace(note.Input) != "" {
+		writeToonScalarField(sb, level+1, "input", note.Input)
+	}
+}
+
+func writeToonExecutorPlan(sb *strings.Builder, level int, plan executorPlanView) {
+	sb.WriteString(toonIndent(level) + toonDisplayKey("plan", level) + ":\n")
+	writeToonListHeader(sb, level+1, "steps", len(plan.Steps))
+	for _, step := range plan.Steps {
+		sb.WriteString(toonIndent(level+2) + "- type: " + strings.TrimSpace(step.Type) + "\n")
+		if step.Number > 0 {
+			writeToonScalarField(sb, level+3, "number", strconv.Itoa(step.Number))
+		}
+		if strings.TrimSpace(step.Tool) != "" {
+			writeToonScalarField(sb, level+3, "tool", step.Tool)
+		}
+		writeToonPlanNote(sb, level+3, step.Note)
+	}
+	writeToonScalarField(sb, level+1, "final", plan.Final)
+}
+
+func writeToonCurrentStep(sb *strings.Builder, level int, step executorStepView) {
+	sb.WriteString(toonIndent(level) + toonDisplayKey("current_step", level) + ":\n")
+	writeToonScalarField(sb, level+1, "type", step.Type)
+	if step.Number > 0 {
+		writeToonScalarField(sb, level+1, "number", strconv.Itoa(step.Number))
+	}
+	if strings.TrimSpace(step.Tool) != "" {
+		writeToonScalarField(sb, level+1, "tool", step.Tool)
+	}
+	if strings.TrimSpace(step.Note.Use) != "" || strings.TrimSpace(step.Note.Why) != "" || strings.TrimSpace(step.Note.Output) != "" || strings.TrimSpace(step.Note.Input) != "" {
+		writeToonPlanNote(sb, level+1, step.Note)
+	}
+}
+
+func renderPlannerPayloadToon(payload plannerPayload) string {
+	doc := toonPlannerPayloadDoc{
+		LatestUserRequest: strings.TrimSpace(payload.LatestUserRequest),
+		Conversation:      toToonConversation(payload.Conversation),
+		AvailableTools:    toToonToolSpecs(payload.AvailableTools),
+		ExecutionTrace:    toToonExecutionTrace(payload.ExecutionTrace),
+	}
+	if rendered, err := renderToonGo(doc); err == nil {
+		return rendered
+	}
+
+	var sb strings.Builder
+	writeToonScalarField(&sb, 0, "latest_user_request", payload.LatestUserRequest)
+	writeToonConversation(&sb, 0, payload.Conversation)
+	writeToonToolSpecs(&sb, 0, payload.AvailableTools)
+	writeToonExecutionTrace(&sb, 0, payload.ExecutionTrace)
+	return strings.TrimSpace(sb.String())
+}
+
+func renderExecutorPayloadToon(payload executorPayload) string {
+	steps := make([]toonExecutorStepDoc, 0, len(payload.Plan.Steps))
+	for _, step := range payload.Plan.Steps {
+		steps = append(steps, toToonExecutorStep(step))
+	}
+	doc := toonExecutorPayloadDoc{
+		LatestUserRequest: strings.TrimSpace(payload.LatestUserRequest),
+		Conversation:      toToonConversation(payload.Conversation),
+		AvailableTools:    toToonToolSpecs(payload.AvailableTools),
+		Plan: toonExecutorPlanDoc{
+			Steps: steps,
+			Final: strings.TrimSpace(payload.Plan.Final),
+		},
+		CurrentStep: toToonExecutorStep(payload.CurrentStep),
+	}
+	if rendered, err := renderToonGo(doc); err == nil {
+		return rendered
+	}
+
+	var sb strings.Builder
+	writeToonScalarField(&sb, 0, "latest_user_request", payload.LatestUserRequest)
+	writeToonConversation(&sb, 0, payload.Conversation)
+	if len(payload.AvailableTools) > 0 {
+		writeToonToolSpecs(&sb, 0, payload.AvailableTools)
+	}
+	writeToonExecutorPlan(&sb, 0, payload.Plan)
+	writeToonCurrentStep(&sb, 0, payload.CurrentStep)
+	return strings.TrimSpace(sb.String())
 }
 
 func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
@@ -1842,7 +2338,7 @@ func requestValidatedPlan(req ChatRequest, registry map[string]ToolSpec) (ToonPl
 	messages := []Message{
 		{Role: "system", Content: contentFromString(buildPlannerSystemPrompt(registry))},
 		{Role: "assistant", Content: contentFromString(plannerPrimerMessage())},
-		{Role: "user", Content: contentFromString(marshalPrettyJSON(plannerPayload{
+		{Role: "user", Content: contentFromString(renderPlannerPayloadToon(plannerPayload{
 			LatestUserRequest: latestUserRequest(req.Messages),
 			Conversation:      normalizeConversation(req.Messages),
 			AvailableTools:    orderedToolSpecs(registry),
@@ -1854,7 +2350,11 @@ func requestValidatedPlan(req ChatRequest, registry map[string]ToolSpec) (ToonPl
 	var lastIssues []string
 
 	for attempt := 1; attempt <= cfg.PlannerMaxAttempts; attempt++ {
-		reply, err := callUpstreamText(plannerModel, messages)
+		reply, err := callUpstreamTextUntil(plannerModel, messages, func(reply string) bool {
+			plan, parseIssues := parseToonPlan(reply, registry)
+			issues := append(parseIssues, validateToonPlan(plan, req.Messages, registry)...)
+			return len(issues) == 0
+		})
 		if err != nil {
 			return ToonPlan{}, fmt.Errorf("planner upstream error: %w", err)
 		}
@@ -1890,7 +2390,6 @@ func buildExecutorPayload(req ChatRequest, plan ToonPlan, registry map[string]To
 	payload := executorPayload{
 		LatestUserRequest: latestUserRequest(req.Messages),
 		Conversation:      normalizeConversation(req.Messages),
-		AvailableTools:    orderedToolSpecs(registry),
 		Plan: executorPlanView{
 			Steps: make([]executorStepView, 0, len(plan.Steps)),
 			Final: plan.Final,
@@ -1903,6 +2402,9 @@ func buildExecutorPayload(req ChatRequest, plan ToonPlan, registry map[string]To
 		})
 	}
 	if len(plan.Steps) > 0 {
+		if spec, ok := registry[plan.Steps[0].Tool]; ok {
+			payload.AvailableTools = []ToolSpec{spec}
+		}
 		payload.CurrentStep = executorStepView{
 			Type: "tool", Number: plan.Steps[0].Number, Tool: plan.Steps[0].Tool, Note: plan.Steps[0].Note,
 		}
@@ -2002,7 +2504,7 @@ func buildToolExecutionPrompt(step ToonStep, registry map[string]ToolSpec) strin
 	sb.WriteString("- no plain JSON; no prose before or after the block.\n")
 	sb.WriteString("- do not return action, name, or arguments wrapper keys.\n")
 	sb.WriteString("- the whole JSON object is the arguments object for tool `" + step.Tool + "`.\n")
-	sb.WriteString("- use the conversation JSON and tool definitions to choose arguments.\n")
+	sb.WriteString("- use the toon payload and tool definitions to choose arguments.\n")
 	if len(spec.Required) > 0 {
 		sb.WriteString("- required args: " + strings.Join(spec.Required, ", ") + ".\n")
 	}
@@ -2159,11 +2661,11 @@ func runExecutor(req ChatRequest, plan ToonPlan, registry map[string]ToolSpec) (
 	if len(plan.Steps) > 0 {
 		step := plan.Steps[0]
 		toolStep = &step
-		payloadJSON := marshalPrettyJSON(buildExecutorPayload(req, plan, registry))
+		payloadToon := renderExecutorPayloadToon(buildExecutorPayload(req, plan, registry))
 		messages = []Message{
 			{Role: "system", Content: contentFromString(buildToolExecutionPrompt(step, registry))},
 			{Role: "assistant", Content: contentFromString(toolExecutionPrimerMessage(step))},
-			{Role: "user", Content: contentFromString(payloadJSON)},
+			{Role: "user", Content: contentFromString(payloadToon)},
 		}
 	} else {
 		messages = append(
@@ -2175,7 +2677,16 @@ func runExecutor(req ChatRequest, plan ToonPlan, registry map[string]ToolSpec) (
 	var lastIssues []string
 	var lastReply string
 	for attempt := 1; attempt <= cfg.ExecutorMaxRetries; attempt++ {
-		reply, err := callUpstreamText(model, messages)
+		var reply string
+		var err error
+		if toolStep != nil {
+			reply, err = callUpstreamTextUntil(model, messages, func(reply string) bool {
+				_, issues := validateExecutorToolReply(reply, *toolStep, registry)
+				return len(issues) == 0
+			})
+		} else {
+			reply, err = callUpstreamText(model, messages)
+		}
 		if err != nil {
 			return ChatResponse{}, fmt.Errorf("executor upstream error: %w", err)
 		}
