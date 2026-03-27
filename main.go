@@ -1834,11 +1834,11 @@ func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
 	sb.WriteString("System messages in the conversation override identity, tone, and language.\n")
 	sb.WriteString("If system requires Vietnamese, any final line must be Vietnamese.\n\n")
 	sb.WriteString("Valid block shapes:\n")
-	sb.WriteString("```toon\nfinal: <one-line answer preview>\n```\n")
+	sb.WriteString("```toon\nfinal: <direct user-facing answer>\n```\n")
 	sb.WriteString("or\n")
 	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\n```\n")
 	sb.WriteString("or\n")
-	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\nfinal: <optional one-line answer preview if this step succeeds>\n```\n\n")
+	sb.WriteString("```toon\nstep 1: <exact_tool_name>\nnote: use=<purpose>; why=<why this is the next step now>; output=<expected result after this one step>; input=<short key input if known>\nfinal: <optional direct answer if this one step succeeds>\n```\n\n")
 	sb.WriteString("Controller rules:\n")
 	sb.WriteString("- Decide only the next immediate action. Never output step 2 or later.\n")
 	sb.WriteString("- Use execution_trace from the current request to decide what should happen next.\n")
@@ -1859,7 +1859,7 @@ func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
 	sb.WriteString("- note must include use=, why=, output=. input= is optional but should include the key tool input when it is already known.\n")
 	sb.WriteString("- never put command, path, url, query, content, or input on a separate line.\n")
 	sb.WriteString("- do not output argument JSON like {\"query\":...}; controller chooses the tool only, executor will produce arguments later.\n")
-	sb.WriteString("- if `final:` is present, it must be the last toon line, one short line, with no bullets, links, URLs, citations, or extra lines after it.\n")
+	sb.WriteString("- if `final:` is present, it must be the last toon line and already be the exact direct answer to return to the user.\n")
 	sb.WriteString("- if a tool could still usefully advance the request, do not jump to final.\n")
 	sb.WriteString("- never invent tools, paths, URLs, contents, or claim work is already done unless execution_trace proves it.\n")
 	sb.WriteString("- Before outputting, ask yourself: what is the one best next move right now?\n")
@@ -1886,12 +1886,12 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	sb.WriteString("Return one fenced toon block only: prefer ```toon ... ```, fallback ``` ... ```.\n")
 	sb.WriteString("Obey system-message persona/language. If system requires Vietnamese, any final line must be Vietnamese.\n")
 	sb.WriteString("Must obey:\n")
-	sb.WriteString("- inside the block: final only, OR exactly one `step 1` + one `note:`, with optional `final:` preview.\n")
+	sb.WriteString("- inside the block: final only, OR exactly one `step 1` + one `note:`, with optional direct-answer `final:`.\n")
 	sb.WriteString("- no JSON, no prose outside the block.\n")
 	sb.WriteString("- decide only the immediate next action; never output step 2 or later.\n")
 	sb.WriteString("- use execution_trace to decide what should happen now.\n")
 	sb.WriteString("- note is one line only; never put input, command, path, url, query, or content on a new line.\n")
-	sb.WriteString("- if `final:` is present, it is one short line only; no bullets/links/URLs after it.\n")
+	sb.WriteString("- if `final:` is present, it must already be the exact direct answer to return to the user; no bullets/links/URLs after it unless truly required.\n")
 	sb.WriteString("- exact tool names only: " + strings.Join(orderedToolNames(registry), ", ") + "\n")
 	sb.WriteString("- no invented tools, paths, URLs, contents, or results.\n")
 	sb.WriteString("- do not claim success unless execution_trace already proves it.\n")
@@ -1900,7 +1900,7 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	sb.WriteString("- HARD BAN: no outbound communication tool for current-chat reply, confirmation, or summary.\n")
 	sb.WriteString("- use message only for explicit outbound delivery to another recipient/channel.\n")
 	sb.WriteString("- send_file is valid only when the artifact already exists or execution_trace strongly shows it was created.\n")
-	sb.WriteString("- VALID pattern: one next step without final, one next step with optional final preview, OR final only.\n")
+	sb.WriteString("- VALID pattern: one next step without final, one next step with optional direct-answer final, OR final only.\n")
 	sb.WriteString("- INVALID pattern: step 1 -> step 2 -> final.\n")
 	sb.WriteString("Fix every issue below:\n")
 	for _, issue := range issues {
@@ -1911,7 +1911,7 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 }
 
 func plannerPrimerMessage() string {
-	return "Understood. I will return one fenced toon block only. I will decide only the immediate next action from the latest execution trace, using either final only or step 1 plus note, with final optional when work should continue."
+	return "Understood. I will return one fenced toon block only. I will decide only the immediate next action from the latest execution trace, and any `final:` line I return will already be the exact direct answer for the user."
 }
 
 func planLineIssueForExtraLine(stepNumber int, line string, lineIndex int) string {
@@ -2574,6 +2574,10 @@ func processToolAwareRequest(req ChatRequest) ChatResponse {
 
 	logSection("VALIDATED NEXT ACTION")
 	fmt.Printf("│\n%s\n", prefixLines(renderToonPlan(plan), "│  "))
+	if len(plan.Steps) == 0 && strings.TrimSpace(plan.Final) != "" && !hasToolActivityAfterLatestUser(req.Messages) {
+		logResult("⚡", "planner returned a direct final answer without tool usage; skipping executor")
+		return makeOpenAIResponse(plan.Final, model, nil)
+	}
 
 	result, err := runExecutor(req, plan, registry)
 	if err != nil {
