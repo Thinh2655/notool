@@ -847,7 +847,13 @@ func extractTextFromUpstreamData(data []byte, headers http.Header) string {
 	return string(data)
 }
 
-func doUpstreamTextRequest(body []byte, stopWhen func(string) bool) (int, http.Header, string, []byte, error) {
+type streamStopDecision struct {
+	Stop       bool
+	LogIcon    string
+	LogMessage string
+}
+
+func doUpstreamTextRequest(body []byte, stopWhen func(string) streamStopDecision) (int, http.Header, string, []byte, error) {
 	if stopWhen == nil {
 		status, headers, data, err := doUpstreamRequest(body)
 		if err != nil {
@@ -906,8 +912,16 @@ func doUpstreamTextRequest(body []byte, stopWhen func(string) bool) (int, http.H
 				if json.Unmarshal([]byte(chunkPayload), &chunk) == nil {
 					if delta := extractTextFromUpstreamChunk(chunk); delta != "" {
 						fullText.WriteString(delta)
-						if stopWhen(fullText.String()) {
-							logResult("⚡", "stream already contains a complete structured reply; stopping upstream stream early")
+						if decision := stopWhen(fullText.String()); decision.Stop {
+							icon := strings.TrimSpace(decision.LogIcon)
+							if icon == "" {
+								icon = "⚡"
+							}
+							message := strings.TrimSpace(decision.LogMessage)
+							if message == "" {
+								message = "stopping upstream stream early"
+							}
+							logResult(icon, message)
 							cancel()
 							_ = resp.Body.Close()
 							return resp.StatusCode, headers, fullText.String(), raw.Bytes(), nil
@@ -936,7 +950,7 @@ func callUpstreamText(model string, messages []Message) (string, error) {
 	return callUpstreamTextUntil(model, messages, nil)
 }
 
-func callUpstreamTextUntil(model string, messages []Message, stopWhen func(string) bool) (string, error) {
+func callUpstreamTextUntil(model string, messages []Message, stopWhen func(string) streamStopDecision) (string, error) {
 	const maxCompactionAttempts = 4
 
 	var lastErr error
@@ -1379,59 +1393,6 @@ func latestUserTurnKey(messages []Message) string {
 	return hex.EncodeToString(hash[:])
 }
 
-func normalizeSimpleConversationText(text string) string {
-	text = strings.ToLower(strings.TrimSpace(text))
-	replacer := strings.NewReplacer(".", " ", ",", " ", "!", " ", "?", " ", ";", " ", ":", " ", "'", " ", `"`, " ", "(", " ", ")", " ")
-	text = replacer.Replace(text)
-	return strings.Join(strings.Fields(text), " ")
-}
-
-func isSimpleConversationRequest(messages []Message) bool {
-	raw := strings.TrimSpace(latestUserRequest(messages))
-	if raw == "" {
-		return false
-	}
-	if raw == "?" {
-		return true
-	}
-	text := normalizeSimpleConversationText(raw)
-	if text == "" {
-		return true
-	}
-	simple := map[string]bool{
-		"hi": true, "hello": true, "hey": true, "ok": true, "oke": true, "okay": true,
-		"thanks": true, "thank you": true, "xin chao": true, "chao": true, "alo": true, "yo": true,
-	}
-	if simple[text] {
-		return true
-	}
-	return len(strings.Fields(text)) <= 2 && len(text) <= 12
-}
-
-func latestRequestLikelyNeedsTool(messages []Message) bool {
-	raw := strings.TrimSpace(latestUserRequest(messages))
-	if raw == "" {
-		return false
-	}
-	text := normalizeSimpleConversationText(raw)
-	if text == "" {
-		return false
-	}
-	keywords := []string{
-		"check", "run", "read", "write", "save", "send", "search", "find", "delete", "remove",
-		"edit", "append", "create", "generate", "export", "build", "compile", "code",
-		"kiem tra", "đọc", "doc", "ghi", "luu", "lưu", "gửi", "tìm",
-		"xóa", "sửa", "thêm", "tạo", "viet", "viết",
-		"chay", "chạy", "file", "folder", "server", "ram", "api", "deploy", "log",
-	}
-	for _, keyword := range keywords {
-		if strings.Contains(text, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
 func hasToolActivityAfterLatestUser(messages []Message) bool {
 	latestUserIndex := -1
 	for i := len(messages) - 1; i >= 0; i-- {
@@ -1448,84 +1409,6 @@ func hasToolActivityAfterLatestUser(messages []Message) bool {
 			return true
 		}
 		if messages[i].Role == "assistant" && len(messages[i].ToolCalls) > 0 {
-			return true
-		}
-	}
-	return false
-}
-
-func hasSpecificToolActivityAfterLatestUser(messages []Message, toolName string) bool {
-	latestUserIndex := -1
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "user" {
-			latestUserIndex = i
-			break
-		}
-	}
-	if latestUserIndex < 0 {
-		return false
-	}
-	for i := latestUserIndex + 1; i < len(messages); i++ {
-		if messages[i].Role == "tool" && strings.TrimSpace(messages[i].Name) == toolName {
-			return true
-		}
-		if messages[i].Role == "assistant" {
-			for _, call := range messages[i].ToolCalls {
-				if strings.TrimSpace(call.Function.Name) == toolName {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func latestRequestLikelyNeedsSendFile(messages []Message) bool {
-	raw := strings.TrimSpace(latestUserRequest(messages))
-	if raw == "" {
-		return false
-	}
-	text := normalizeSimpleConversationText(raw)
-	if text == "" {
-		return false
-	}
-	keywords := []string{
-		"gui", "gửi", "send", "share", "deliver", "attach", "upload",
-		"send me", "gui cho toi", "gửi cho tôi", "share with me", "deliver to me",
-	}
-	for _, keyword := range keywords {
-		if strings.Contains(text, keyword) {
-			return true
-		}
-	}
-	return false
-}
-
-func latestRequestLikelyNeedsOutboundMessage(messages []Message) bool {
-	raw := strings.TrimSpace(latestUserRequest(messages))
-	if raw == "" {
-		return false
-	}
-	text := normalizeSimpleConversationText(raw)
-	if text == "" {
-		return false
-	}
-	phrases := []string{
-		"send message", "message to", "text to", "dm ", "telegram", "whatsapp", "chat id", "channel",
-		"gui tin nhan", "gửi tin nhắn", "nhan cho", "nhắn cho", "gui qua telegram", "gửi qua telegram",
-		"gui qua whatsapp", "gửi qua whatsapp",
-	}
-	for _, phrase := range phrases {
-		if strings.Contains(text, phrase) {
-			return true
-		}
-	}
-	return false
-}
-
-func planIncludesTool(plan ToonPlan, toolName string) bool {
-	for _, step := range plan.Steps {
-		if step.Tool == toolName {
 			return true
 		}
 	}
@@ -1634,29 +1517,26 @@ func normalizeMultilineText(text string) string {
 	return strings.TrimSpace(text)
 }
 
-func unwrapMarkdownFence(text string) string {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" || !strings.Contains(trimmed, "```") {
-		return trimmed
-	}
-
-	if inner, ok := unwrapFullMarkdownFence(trimmed); ok {
-		return inner
-	}
-
-	anyBlock := regexp.MustCompile("(?s)```(?:[A-Za-z0-9_-]+)?\\s*\\n?(.*?)\\n?```")
-	if match := anyBlock.FindStringSubmatch(trimmed); len(match) == 2 {
-		return strings.TrimSpace(match[1])
-	}
-	return trimmed
-}
-
 func unwrapFullMarkdownFence(text string) (string, bool) {
 	fullBlock := regexp.MustCompile("(?s)^\\s*```(?:[A-Za-z0-9_-]+)?\\s*\\n?(.*?)\\n?```\\s*$")
 	if match := fullBlock.FindStringSubmatch(strings.TrimSpace(text)); len(match) == 2 {
 		return strings.TrimSpace(match[1]), true
 	}
 	return "", false
+}
+
+func unwrapPlannerReply(text string) (string, []string) {
+	trimmed := normalizeMultilineText(text)
+	if trimmed == "" {
+		return "", nil
+	}
+	if !strings.Contains(trimmed, "```") {
+		return trimmed, nil
+	}
+	if inner, ok := unwrapFullMarkdownFence(trimmed); ok {
+		return inner, nil
+	}
+	return "", []string{"planner reply must be exactly one fenced block with no extra text before or after it"}
 }
 
 func cleanAssistantAnswer(text string) string {
@@ -1849,10 +1729,10 @@ func buildPlannerSystemPrompt(registry map[string]ToolSpec) string {
 	sb.WriteString("- Do not repeat the same discovery/inspection step if execution_trace already contains enough information to move forward.\n")
 	sb.WriteString("- Select tools only from the Available tools list for this request.\n")
 	sb.WriteString("- Prefer the tool whose description most directly performs the next needed action.\n")
-	sb.WriteString("- Do not replace a direct-action tool with a research or lookup tool when the request is to create, edit, run, send, or modify something.\n")
-	sb.WriteString("- HARD BAN: final already answers the current user; do not add any outbound communication step just to reply, confirm, summarize, or repeat the result in the current chat.\n")
-	sb.WriteString("- Use an outbound communication tool only if the user explicitly asks to send something to another recipient or channel, or to deliver a file/artifact.\n")
-	sb.WriteString("- send_file must only be chosen after the artifact exists or the execution trace strongly indicates it was created.\n")
+	sb.WriteString("- Prefer the tool whose effect most directly advances the request.\n")
+	sb.WriteString("- Prefer `final:` when the request can already be answered in the current chat from the available evidence.\n")
+	sb.WriteString("- Use outbound communication tools only when the next action clearly requires external delivery beyond the current chat.\n")
+	sb.WriteString("- Choose send_file only when the artifact already exists or the execution_trace shows it was created.\n")
 	sb.WriteString("- read_file is allowed when you need exact instructions before deciding a safe command or next tool.\n")
 	sb.WriteString("- exact tool names only; the only valid step number is step 1.\n")
 	sb.WriteString("- one note line immediately after step 1; note must stay on one physical line.\n")
@@ -1896,10 +1776,9 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	sb.WriteString("- no invented tools, paths, URLs, contents, or results.\n")
 	sb.WriteString("- do not claim success unless execution_trace already proves it.\n")
 	sb.WriteString("- do not repeat the same discovery/inspection step if execution_trace already contains the needed information.\n")
-	sb.WriteString("- final already answers the current user.\n")
-	sb.WriteString("- HARD BAN: no outbound communication tool for current-chat reply, confirmation, or summary.\n")
-	sb.WriteString("- use message only for explicit outbound delivery to another recipient/channel.\n")
-	sb.WriteString("- send_file is valid only when the artifact already exists or execution_trace strongly shows it was created.\n")
+	sb.WriteString("- prefer final when the request is already answerable in the current chat.\n")
+	sb.WriteString("- use outbound communication tools only when the next action clearly requires external delivery beyond the current chat.\n")
+	sb.WriteString("- choose send_file only when the artifact already exists or execution_trace strongly shows it was created.\n")
 	sb.WriteString("- VALID pattern: one next step without final, one next step with optional direct-answer final, OR final only.\n")
 	sb.WriteString("- INVALID pattern: step 1 -> step 2 -> final.\n")
 	sb.WriteString("Fix every issue below:\n")
@@ -1908,10 +1787,6 @@ func buildPlannerCorrection(issues []string, retryNumber int, registry map[strin
 	}
 	sb.WriteString("Return the rewritten toon plan now.")
 	return strings.TrimSpace(sb.String())
-}
-
-func plannerPrimerMessage() string {
-	return "Understood. I will return one fenced toon block only. I will decide only the immediate next action from the latest execution trace, and any `final:` line I return will already be the exact direct answer for the user."
 }
 
 func planLineIssueForExtraLine(stepNumber int, line string, lineIndex int) string {
@@ -1933,17 +1808,19 @@ func parsePlanNote(raw string) (PlanNote, []string) {
 		return note, []string{"note is empty"}
 	}
 	fields := map[string]string{}
-	for _, part := range strings.Split(note.Raw, ";") {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	fieldRe := regexp.MustCompile(`(?i)(^|[;,])\s*(use|why|output|input)\s*[:=]`)
+	matches := fieldRe.FindAllStringSubmatchIndex(note.Raw, -1)
+	for i, match := range matches {
+		if len(match) < 6 {
 			continue
 		}
-		index := strings.IndexAny(part, "=:")
-		if index <= 0 {
-			continue
+		key := strings.ToLower(strings.TrimSpace(note.Raw[match[4]:match[5]]))
+		valueStart := match[1]
+		valueEnd := len(note.Raw)
+		if i+1 < len(matches) {
+			valueEnd = matches[i+1][0]
 		}
-		key := strings.ToLower(strings.TrimSpace(part[:index]))
-		value := strings.TrimSpace(part[index+1:])
+		value := strings.TrimSpace(strings.Trim(note.Raw[valueStart:valueEnd], " \t\r\n;,"))
 		if value != "" {
 			fields[key] = value
 		}
@@ -1994,10 +1871,12 @@ func collectPlannerFinalText(lines []string, start int, finalRe, stepRe, noteRe 
 }
 
 func parseToonPlan(raw string, registry map[string]ToolSpec) (ToonPlan, []string) {
-	normalized := normalizeMultilineText(unwrapMarkdownFence(raw))
-	plan := ToonPlan{Raw: normalized}
-	var issues []string
+	plan := ToonPlan{Raw: normalizeMultilineText(raw)}
+	normalized, issues := unwrapPlannerReply(raw)
 	if normalized == "" {
+		if len(issues) > 0 {
+			return plan, issues
+		}
 		return plan, []string{"planner returned an empty plan"}
 	}
 
@@ -2097,13 +1976,6 @@ func validateToonPlan(plan ToonPlan, messages []Message, registry map[string]Too
 	if len(plan.Steps) == 0 {
 		if plan.Final == "" {
 			issues = append(issues, "planner must return either at least one tool step or a `final:` line")
-			return issues
-		}
-		if latestRequestLikelyNeedsTool(messages) && !hasToolActivityAfterLatestUser(messages) && !isSimpleConversationRequest(messages) {
-			issues = append(issues, "latest request likely still needs a tool, so planner cannot jump directly to final")
-		}
-		if _, ok := registry["send_file"]; ok && latestRequestLikelyNeedsSendFile(messages) && !hasSpecificToolActivityAfterLatestUser(messages, "send_file") {
-			issues = append(issues, "latest request asks to send/deliver a file, so the remaining plan must include send_file before final")
 		}
 		return issues
 	}
@@ -2115,19 +1987,116 @@ func validateToonPlan(plan ToonPlan, messages []Message, registry map[string]Too
 		if _, ok := registry[step.Tool]; !ok {
 			issues = append(issues, fmt.Sprintf("step %d uses tool `%s` which is not in the tool list", step.Number, step.Tool))
 		}
-		if step.Tool == "message" && !latestRequestLikelyNeedsOutboundMessage(messages) {
-			issues = append(issues, "message tool must not be used to answer the current chat; use final instead")
-		}
 		if strings.TrimSpace(step.Note.Use) == "" || strings.TrimSpace(step.Note.Why) == "" || strings.TrimSpace(step.Note.Output) == "" {
 			issues = append(issues, fmt.Sprintf("step %d note must contain use=, why=, and output=", step.Number))
 		}
 	}
-	if _, ok := registry["send_file"]; ok && latestRequestLikelyNeedsSendFile(messages) &&
-		!hasSpecificToolActivityAfterLatestUser(messages, "send_file") &&
-		!planIncludesTool(plan, "send_file") {
-		issues = append(issues, "latest request asks to send/deliver a file, so the remaining plan must include send_file before final")
-	}
 	return issues
+}
+
+func completedPlannerStreamLines(text string) []string {
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	hasTrailingNewline := strings.HasSuffix(text, "\n")
+	lines := strings.Split(text, "\n")
+	if !hasTrailingNewline && len(lines) > 0 {
+		lines = lines[:len(lines)-1]
+	}
+
+	result := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	return result
+}
+
+func plannerMalformedStreamReason(reply string) string {
+	trimmed := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(reply, "\r\n", "\n"), "\r", "\n"))
+	if trimmed == "" {
+		return ""
+	}
+
+	step1Re := regexp.MustCompile(`(?i)^step\s+1\s*:`)
+	anyStepRe := regexp.MustCompile(`(?i)^step\s+\d+\s*:`)
+	finalRe := regexp.MustCompile(`(?i)^final\s*:`)
+	noteRe := regexp.MustCompile(`(?i)^note\s*:`)
+
+	lines := completedPlannerStreamLines(reply)
+	if len(lines) == 0 {
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "note:"),
+			strings.HasPrefix(lower, "command:"),
+			strings.HasPrefix(lower, "command="),
+			strings.HasPrefix(lower, "content:"),
+			strings.HasPrefix(lower, "content="),
+			strings.HasPrefix(lower, "path:"),
+			strings.HasPrefix(lower, "path="),
+			strings.HasPrefix(lower, "task:"),
+			strings.HasPrefix(lower, "task="),
+			strings.HasPrefix(lower, "{"),
+			strings.HasPrefix(lower, "["):
+			return fmt.Sprintf("planner stream malformed early: first line starts with `%s`; expected fenced block, `step 1:`, or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(trimmed, 60))
+		case anyStepRe.MatchString(trimmed) && !step1Re.MatchString(trimmed):
+			return fmt.Sprintf("planner stream malformed early: first line starts with `%s`; expected `step 1:` or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(trimmed, 60))
+		default:
+			return ""
+		}
+	}
+
+	first := lines[0]
+	switch {
+	case strings.HasPrefix(strings.ToLower(first), "```"):
+		if len(lines) < 2 {
+			return ""
+		}
+		second := lines[1]
+		if step1Re.MatchString(second) || finalRe.MatchString(second) {
+			if step1Re.MatchString(second) && len(lines) >= 3 && !noteRe.MatchString(lines[2]) {
+				return fmt.Sprintf("planner stream malformed early: line 3 starts with `%s`; expected `note:` immediately after `step 1:`. Aborting this attempt and retrying.", oneLineLogPreview(lines[2], 80))
+			}
+			return ""
+		}
+		return fmt.Sprintf("planner stream malformed early: line 2 inside fenced block starts with `%s`; expected `step 1:` or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(second, 80))
+	case step1Re.MatchString(first):
+		if len(lines) < 2 {
+			return ""
+		}
+		if noteRe.MatchString(lines[1]) {
+			return ""
+		}
+		return fmt.Sprintf("planner stream malformed early: line 2 starts with `%s`; expected `note:` immediately after `step 1:`. Aborting this attempt and retrying.", oneLineLogPreview(lines[1], 80))
+	case finalRe.MatchString(first):
+		return ""
+	case noteRe.MatchString(first):
+		return fmt.Sprintf("planner stream malformed early: first line starts with `%s`; expected `step 1:` or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(first, 80))
+	case anyStepRe.MatchString(first):
+		return fmt.Sprintf("planner stream malformed early: first line starts with `%s`; expected `step 1:` or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(first, 80))
+	default:
+		return fmt.Sprintf("planner stream malformed early: first line starts with `%s`; expected fenced block, `step 1:`, or `final:`. Aborting this attempt and retrying.", oneLineLogPreview(first, 80))
+	}
+}
+
+func plannerStreamDecision(reply string, registry map[string]ToolSpec, messages []Message) streamStopDecision {
+	if reason := plannerMalformedStreamReason(reply); reason != "" {
+		return streamStopDecision{Stop: true, LogIcon: "⚠️", LogMessage: reason}
+	}
+
+	plan, parseIssues := parseToonPlan(reply, registry)
+	if len(parseIssues) > 0 {
+		return streamStopDecision{}
+	}
+	if len(validateToonPlan(plan, messages, registry)) == 0 {
+		return streamStopDecision{
+			Stop:       true,
+			LogIcon:    "⚡",
+			LogMessage: "planner stream already contains a complete structured reply; stopping upstream stream early",
+		}
+	}
+	return streamStopDecision{}
 }
 
 func renderToonPlan(plan ToonPlan) string {
@@ -2158,7 +2127,6 @@ func requestValidatedPlan(req ChatRequest, registry map[string]ToolSpec) (ToonPl
 
 	messages := []Message{
 		{Role: "system", Content: contentFromString(buildPlannerSystemPrompt(registry))},
-		{Role: "assistant", Content: contentFromString(plannerPrimerMessage())},
 		{Role: "user", Content: contentFromString(payloadToon)},
 	}
 	plannerModel := resolvedPlannerModel(req.Model)
@@ -2166,16 +2134,17 @@ func requestValidatedPlan(req ChatRequest, registry map[string]ToolSpec) (ToonPl
 	var lastIssues []string
 
 	for attempt := 1; attempt <= cfg.PlannerMaxAttempts; attempt++ {
-		reply, err := callUpstreamTextUntil(plannerModel, messages, func(reply string) bool {
-			plan, parseIssues := parseToonPlan(reply, registry)
-			issues := append(parseIssues, validateToonPlan(plan, req.Messages, registry)...)
-			return len(issues) == 0
+		reply, err := callUpstreamTextUntil(plannerModel, messages, func(reply string) streamStopDecision {
+			return plannerStreamDecision(reply, registry, req.Messages)
 		})
 		if err != nil {
 			return ToonPlan{}, fmt.Errorf("planner upstream error: %w", err)
 		}
 		plan, parseIssues := parseToonPlan(reply, registry)
-		issues := append(parseIssues, validateToonPlan(plan, req.Messages, registry)...)
+		issues := append([]string{}, parseIssues...)
+		if len(issues) == 0 {
+			issues = append(issues, validateToonPlan(plan, req.Messages, registry)...)
+		}
 		if len(issues) == 0 {
 			return plan, nil
 		}
@@ -2499,9 +2468,16 @@ func runExecutor(req ChatRequest, plan ToonPlan, registry map[string]ToolSpec) (
 		var reply string
 		var err error
 		if toolStep != nil {
-			reply, err = callUpstreamTextUntil(model, messages, func(reply string) bool {
+			reply, err = callUpstreamTextUntil(model, messages, func(reply string) streamStopDecision {
 				_, issues := validateExecutorToolReply(reply, *toolStep, registry)
-				return len(issues) == 0
+				if len(issues) == 0 {
+					return streamStopDecision{
+						Stop:       true,
+						LogIcon:    "⚡",
+						LogMessage: "executor stream already contains a complete JSON arguments block; stopping upstream stream early",
+					}
+				}
+				return streamStopDecision{}
 			})
 		} else {
 			reply, err = callUpstreamText(model, messages)
