@@ -847,6 +847,61 @@ func extractTextFromUpstreamData(data []byte, headers http.Header) string {
 	return string(data)
 }
 
+func extractErrorMessageFromJSONObject(data []byte) string {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+
+	var readMessage func(value interface{}) string
+	readMessage = func(value interface{}) string {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		case map[string]interface{}:
+			for _, key := range []string{"message", "detail", "error_description"} {
+				if nested, ok := typed[key]; ok {
+					if msg := readMessage(nested); msg != "" {
+						return msg
+					}
+				}
+			}
+		}
+		return ""
+	}
+
+	for _, key := range []string{"error", "detail", "message"} {
+		if value, ok := raw[key]; ok {
+			if msg := readMessage(value); msg != "" {
+				return msg
+			}
+		}
+	}
+	return ""
+}
+
+func extractUpstreamErrorMessage(data []byte, headers http.Header) string {
+	if msg := extractErrorMessageFromJSONObject(data); msg != "" {
+		return msg
+	}
+
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		chunkPayload := strings.TrimSpace(strings.TrimPrefix(line, "data: "))
+		if chunkPayload == "" || chunkPayload == "[DONE]" {
+			continue
+		}
+		if msg := extractErrorMessageFromJSONObject([]byte(chunkPayload)); msg != "" {
+			return msg
+		}
+	}
+
+	return ""
+}
+
 type streamStopDecision struct {
 	Stop       bool
 	LogIcon    string
@@ -858,6 +913,11 @@ func doUpstreamTextRequest(body []byte, stopWhen func(string) streamStopDecision
 		status, headers, data, err := doUpstreamRequest(body)
 		if err != nil {
 			return 0, nil, "", nil, err
+		}
+		if status == http.StatusOK {
+			if errorMessage := extractUpstreamErrorMessage(data, headers); errorMessage != "" {
+				return 0, nil, "", data, fmt.Errorf("upstream returned error payload: %s", errorMessage)
+			}
 		}
 		return status, headers, extractTextFromUpstreamData(data, headers), data, nil
 	}
@@ -908,6 +968,9 @@ func doUpstreamTextRequest(body []byte, stopWhen func(string) streamStopDecision
 				if chunkPayload == "[DONE]" {
 					break
 				}
+				if errorMessage := extractUpstreamErrorMessage([]byte(chunkPayload), http.Header{"Content-Type": []string{"application/json"}}); errorMessage != "" {
+					return 0, nil, "", raw.Bytes(), fmt.Errorf("upstream stream error: %s", errorMessage)
+				}
 				var chunk upstreamResponse
 				if json.Unmarshal([]byte(chunkPayload), &chunk) == nil {
 					if delta := extractTextFromUpstreamChunk(chunk); delta != "" {
@@ -941,6 +1004,9 @@ func doUpstreamTextRequest(body []byte, stopWhen func(string) streamStopDecision
 	data := raw.Bytes()
 	text := fullText.String()
 	if text == "" {
+		if errorMessage := extractUpstreamErrorMessage(data, headers); errorMessage != "" {
+			return 0, nil, "", data, fmt.Errorf("upstream stream error: %s", errorMessage)
+		}
 		text = extractTextFromUpstreamData(data, headers)
 	}
 	return resp.StatusCode, headers, text, data, nil
@@ -1001,6 +1067,31 @@ func callUpstreamTextUntil(model string, messages []Message, stopWhen func(strin
 	return "", fmt.Errorf("upstream request failed without a usable response")
 }
 
+func isJSONDocument(data []byte) bool {
+	var raw json.RawMessage
+	return json.Unmarshal(data, &raw) == nil
+}
+
+func normalizeRawUpstreamResponse(model string, headers http.Header, data []byte) ([]byte, http.Header, bool) {
+	if isJSONDocument(data) {
+		return nil, nil, false
+	}
+
+	text := strings.TrimSpace(extractTextFromUpstreamData(data, headers))
+	if text == "" {
+		return nil, nil, false
+	}
+
+	body, err := json.Marshal(makeOpenAIResponse(text, resolvedChatModel(model), nil))
+	if err != nil {
+		return nil, nil, false
+	}
+
+	responseHeaders := make(http.Header)
+	responseHeaders.Set("Content-Type", "application/json")
+	return body, responseHeaders, true
+}
+
 func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
 	const maxCompactionAttempts = 4
 
@@ -1030,6 +1121,13 @@ func proxyUpstreamRaw(body []byte) (int, http.Header, []byte, error) {
 		status, headers, data, err := doUpstreamRequest(currentBody)
 		if err != nil {
 			return 0, nil, nil, err
+		}
+		if parseOK && !parsed.Stream && status == http.StatusOK {
+			if normalized, normalizedHeaders, ok := normalizeRawUpstreamResponse(parsed.Model, headers, data); ok {
+				log.Printf("raw upstream returned non-JSON content for a non-stream request; normalizing response to JSON")
+				headers = normalizedHeaders
+				data = normalized
+			}
 		}
 		lastStatus, lastHeaders, lastData = status, headers, data
 		if !parseOK || !isContextLimitResponse(status, data) || attempt == maxCompactionAttempts-1 {
@@ -1525,8 +1623,30 @@ func unwrapFullMarkdownFence(text string) (string, bool) {
 	return "", false
 }
 
-func unwrapPlannerReply(text string) (string, []string) {
+func stripLeadingPlannerThinkBlocks(text string) (string, bool) {
 	trimmed := normalizeMultilineText(text)
+	for {
+		lower := strings.ToLower(trimmed)
+		switch {
+		case strings.HasPrefix(lower, "<think>"):
+			end := strings.Index(lower, "</think>")
+			if end < 0 {
+				return "", true
+			}
+			trimmed = strings.TrimSpace(trimmed[end+len("</think>"):])
+		case strings.HasPrefix(lower, "</think>"):
+			trimmed = strings.TrimSpace(trimmed[len("</think>"):])
+		default:
+			return trimmed, false
+		}
+	}
+}
+
+func unwrapPlannerReply(text string) (string, []string) {
+	trimmed, waitingForThinkClose := stripLeadingPlannerThinkBlocks(text)
+	if waitingForThinkClose {
+		return "", []string{"planner reply started a `<think>` block but never closed it"}
+	}
 	if trimmed == "" {
 		return "", nil
 	}
@@ -2014,7 +2134,10 @@ func completedPlannerStreamLines(text string) []string {
 }
 
 func plannerMalformedStreamReason(reply string) string {
-	trimmed := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(reply, "\r\n", "\n"), "\r", "\n"))
+	trimmed, waitingForThinkClose := stripLeadingPlannerThinkBlocks(reply)
+	if waitingForThinkClose {
+		return ""
+	}
 	if trimmed == "" {
 		return ""
 	}
@@ -2024,7 +2147,7 @@ func plannerMalformedStreamReason(reply string) string {
 	finalRe := regexp.MustCompile(`(?i)^final\s*:`)
 	noteRe := regexp.MustCompile(`(?i)^note\s*:`)
 
-	lines := completedPlannerStreamLines(reply)
+	lines := completedPlannerStreamLines(trimmed)
 	if len(lines) == 0 {
 		lower := strings.ToLower(trimmed)
 		switch {
